@@ -18,7 +18,6 @@
 - **切到后台持续滚动**：通过官方歌词引擎反射驱动，离开播放界面 / 锁屏 / 切到桌面都不断更；
 - **歌词提前上屏**：状态栏歌词比实际人声进度提前约 `400ms`，抵消状态栏 ticker 渲染延迟（观感"歌词先到、人声后到"）；
 - **移除状态栏左侧音符图标**：仅保留歌词文本（`ticker_icon_switch = false`）；
-- Apple Music **设置页内提供「状态栏歌词」开关**，实时生效，无需重启或去 LSPosed 取消激活；
 - 同时支持在线歌词与本地 LRC 歌词（`LrcParser`）。
 
 ## 工作原理
@@ -69,7 +68,6 @@ Apple Music 进程
 | 4 | `com.apple.android.music.ttml.SongInfoTimeProcessor.processEvents` | ★ 反射驱动官方歌词引擎，无 UI / 后台均逐行推送 |
 | 5 | `com.apple.android.music.playback.controller.LocalMediaPlayerController.onPlaybackStateChanged`（3 参，末参 int） | 播放状态：`0=停止 1=播放 2=暂停` + 控制器实例捕获 |
 | 6 | `android.app.NotificationManager.notify` / `cancel` | 载波模式：歌词 Ticker 注入宿主媒体通知 |
-| 7 | `androidx.preference.PreferenceFragmentCompat.setPreferenceScreen` | 在 Apple Music 设置页注入「状态栏歌词」开关 |
 
 **歌词数据提取链**（`NativeLyricsParser.kt`，全部走反射、逐步判空）：
 
@@ -134,8 +132,7 @@ Apple Music 更新后若类名/方法名变化，用 jadx-gui 打开新 APK，�
 - 轮询跑在宿主主线程（与播放界面 Fragment 的 Handler 同线程，`processEvents` 内部调
   原生方法需同线程防并发），`MAX_DELAY_MS` 心跳兼顾跟手感与后台存活；
 - Hook 回调里只做轻量状态记录，通知构建全部延迟到轮询线程；
-- 播放器实例用 `WeakReference` 持有，不阻碍宿主 GC；
-- 模块开关由 `Settings` 经 `SharedPreferences`（`am_flyme_prefs.xml`）持久化，设置页拨动实时生效。
+- 播放器实例用 `WeakReference` 持有，不阻碍宿主 GC。
 
 ## 四、构建
 
@@ -185,9 +182,8 @@ legacy API**，这是框架强制行为，不是建议。
 2. 在 **LSPosed 管理器 → 模块** 中启用「AM 歌词 · Flyme」；
 3. 作用域已通过 `scope.list` + `staticScope=true` **固定为 Apple Music**，
    无需（也无法）手动勾选其它应用；
-4. 在 Apple Music **设置 → 状态栏歌词** 中确认开关已开启（默认开启）；
-5. 强制停止并重新打开 Apple Music，播放任意歌曲；
-6. 状态栏出现歌词即为成功。
+4. 强制停止并重新打开 Apple Music，播放任意歌曲；
+5. 状态栏出现歌词即为成功。
 
 排错：
 
@@ -203,8 +199,7 @@ adb logcat -s AMFlymeLyric
 
 - 适配 Apple Music **5.2.0** 验证，大版本更新后需按 jadx 指南重定位（计划接入 DexKit 自动匹配）；
 - 翻译歌词默认关闭（`LyricController.SHOW_TRANSLATION`），状态栏宽度有限，开启后原文·译文同行显示；
-- Apple Music 无损 / 杜比全景声歌曲的歌词时间轴与普通曲目一致，无额外处理；
-- 设置页开关已实现（`Settings` + `PreferenceFragmentCompat` 注入），如需更多偏好（翻译、暂停清除等）可扩展。
+- Apple Music 无损 / 杜比全景声歌曲的歌词时间轴与普通曲目一致，无额外处理。
 
 ## 致谢
 
