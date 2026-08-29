@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AM 歌词 · Flyme</string>
+    <string name="app_description">Apple Music 状态栏歌词（魅族 Flyme），基于 libxposed API 102</string>
+</resources>

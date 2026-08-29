@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      libxposed 现代 API 不再使用 manifest 里的 xposed* meta-data：
+        - 模块名       → android:label
+        - 模块描述     → android:description
+        - 作用域       → META-INF/xposed/scope.list
+        - API 版本声明 → META-INF/xposed/module.prop
+        - Java 入口    → META-INF/xposed/java_init.list
+
+      模块运行在 com.apple.android.music (Apple Music) 进程内，
+      通知权限由宿主持有，无需在此声明运行时权限。
+    -->
+
+    <application
+        android:label="@string/app_name"
+        android:description="@string/app_description"
+        android:icon="@android:drawable/ic_media_play"
+        android:allowBackup="false" />
+</manifest>

@@ -1,0 +1,34 @@
+# ===== 构建 / 缓存（非源码，禁止上传） =====
+.build-env/
+.gradle/
+.analysis/
+.apk_analysis/
+platform-tools/
+Apple Music_5.2.0.apks
+build/
+app/build/
+*.log
+build*.log
+captures/
+
+# ===== 签名密钥（机密，绝不入库） =====
+am-release.keystore
+*.keystore
+*.jks
+
+# ===== 构建产物 / 签名包 =====
+app-release-unsigned.apk
+app-release-signed.apk
+app-release-signed.apk.idsig
+*.apk.idsig
+
+# ===== 内部工作区记忆（不对外） =====
+.workbuddy/
+
+# ===== 标准 Android / Gradle / IDE 忽略 =====
+*.iml
+.idea/
+local.properties
+.DS_Store
+.externalNativeBuild/
+.cxx/
