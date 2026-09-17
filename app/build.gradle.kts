@@ -15,8 +15,8 @@ android {
         targetSdk = 36
         // 仓库里能下到的最新稳定 build-tools 是 35.0.1（无 35.0.0）
         buildToolsVersion = "35.0.1"
-        versionCode = 15
-        versionName = "1.3.10"
+        versionCode = 16
+        versionName = "1.3.11"
     }
 
     buildTypes {

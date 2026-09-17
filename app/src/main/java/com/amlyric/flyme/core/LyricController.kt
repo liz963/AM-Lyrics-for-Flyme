@@ -62,6 +62,18 @@ object LyricController {
         FlymeStatusBarLyric.update(text)
     }
 
+    /**
+     * 推送「歌曲名-歌手名」(v1.3.11 新功能)。
+     * 仅在播放最开头时由 BackgroundLyrics 调用一次：作为状态栏首条内容先露歌名，
+     * 随后第一句歌词上来时由 onLyricLine 自然替换。
+     */
+    @Synchronized
+    fun onSongMeta(text: String?) {
+        if (text.isNullOrBlank()) return
+        noLyricHintShown = false
+        FlymeStatusBarLyric.update(text)
+    }
+
     @Synchronized
     fun onLyricsLoaded(songId: String?) {
         // 仅同步歌曲标识（无 UI 加载兜底 + UI 路径都会走到这里），

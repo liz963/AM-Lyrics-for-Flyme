@@ -82,6 +82,13 @@ object BackgroundLyrics {
      */
     private const val LEAD_MS = 1000L
 
+    /**
+     * 「从头播放」位置阈值(ms)。当前位置 ≤ 该值时判定为歌曲开头，推送「歌曲名-歌手名」；
+     * 大于该值（拖动进度条/跳播/中段续播）一律视为非开头，只推歌词、不推歌名。
+     * 取 1500ms 兼顾 LEAD_MS 提前量与播放启动延迟，避免首 tick 略迟于 0 而漏推。
+     */
+    private const val TITLE_PUSH_MAX_POS_MS = 1500L
+
     private const val CLS_TIME_PROCESSOR =
         "com.apple.android.music.ttml.SongInfoTimeProcessor"
     private const val CLS_SONG_PTR =
@@ -136,6 +143,9 @@ object BackgroundLyrics {
     /** 当前已上屏文本，用于去重，避免同一行被重复推送 */
     @Volatile
     private var displayedText: String? = null
+    /** 本首歌是否已推送过「歌曲名-歌手名」(只在首次进歌推一次，循环/重头不重复推) */
+    @Volatile
+    private var titlePushed = false
     /** 探测调用临时承接变量（单线程 handler，调用后即读即清） */
     private var peekedText: String? = null
 
@@ -162,9 +172,15 @@ object BackgroundLyrics {
                 nextLineText = null
                 nextLineStart = -1L
                 displayedText = null
+                // 切歌：歌名推送标记复位（只在首次进这首歌推一次）
+                titlePushed = false
                 LyricController.onSongChanged(key)
                 XLog.d("song key -> $key (storeId=$storeId)")
             }
+
+            // 新增：播放最开头时推送一次「歌曲名-歌手名」(放在 ptr 守卫之前，
+            // 不依赖歌词句柄是否就绪，避免歌词未加载时错过开头窗口)
+            maybePushSongTitle(item)
 
             // 2. 当前歌没有 ptr：先查会话缓存，再主动取词
             if (songPtr == null) {
@@ -228,6 +244,7 @@ object BackgroundLyrics {
         nextLineText = null
         nextLineStart = -1L
         displayedText = null
+        titlePushed = false
         LyricsLoader.resetSession()
     }
 
@@ -237,6 +254,38 @@ object BackgroundLyrics {
     }
 
     // ─────────────────────────── 内部实现 ───────────────────────────
+
+    /**
+     * 播放最开头时推送一次「歌曲名-歌手名」(v1.3.11 新功能)。
+     *
+     * 判定条件（三者同时满足才推）：
+     *  1. 本首歌尚未推过歌名（titlePushed == false，只在首次进歌推一次）；
+     *  2. 正在播放（playing == true，暂停/停止态不推）；
+     *  3. 当前位置在开头阈值内（pos ≤ TITLE_PUSH_MAX_POS_MS）。
+     *
+     * 位置判断天然覆盖「拖动进度条 / 跳播 / 中段续播」等非开头场景——
+     * 这些情形 pos 明显大于阈值，直接走歌词推送、不推歌名。
+     * 该检查不依赖 lyrics ptr，因此由 onTick 在 ptr 守卫之前调用。
+     */
+    private fun maybePushSongTitle(item: Any) {
+        if (titlePushed) return
+        if (!playing) return
+        val c = controller ?: return
+        val pos = ReflectCompat.long(c, "getCurrentPosition")
+        if (pos < 0L || pos > TITLE_PUSH_MAX_POS_MS) return
+
+        val title = ReflectCompat.string(item, "getTitle")
+        if (title.isNullOrBlank()) return
+        // 歌手名：真实 PlayerMediaItem 优先取 getArtistName，拿不到再依次退而求其次
+        val artist = ReflectCompat.string(item, "getArtistName")
+            ?: ReflectCompat.string(item, "getArtist")
+            ?: ReflectCompat.string(item, "getAlbumArtist")
+        val meta = if (artist.isNullOrBlank()) title else "$title - $artist"
+
+        LyricController.onSongMeta(meta)
+        titlePushed = true
+        XLog.d("song meta pushed at pos=$pos: $meta")
+    }
 
     private fun ensurePolling() {
         if (polling) return
