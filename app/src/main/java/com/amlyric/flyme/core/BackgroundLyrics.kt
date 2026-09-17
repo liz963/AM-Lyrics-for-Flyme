@@ -8,7 +8,7 @@ import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 
 /**
- * 位置驱动歌词调度器 v7（v1.3.7 = v1.3.6 基线 + LEAD_MS 由 400ms 提升到 1000ms，歌词提前 1 秒上屏）。
+ * 位置驱动歌词调度器 v8（v1.3.8 = v1.3.7 + B 方案「下一行探测 + 时间戳精准调度」+ LEAD_MS 由 1000ms 提升到 2000ms，歌词提前 2 秒上屏）。
  *
  * 【v1.3.6 变更】
  *  1. 回滚 v1.3.4 的「取消延迟上限」改动 —— 该改动导致后台歌词完全停更；
@@ -16,8 +16,12 @@ import java.lang.reflect.Proxy
  *  2. 纠正 processEvents 返回值语义：它是【下一歌词事件的绝对位置(ms)】，
  *     不是延迟。换算 delay = nextEventPos - queryPos 后，既精准对齐官方
  *     进度（误差 < 100ms），又不会出现长时挂起。
- *  3. 新增 LEAD_MS 提前量：喂给官方引擎的位置 = 实际位置 + 1000ms（v1.3.7 起），
- *     使状态栏歌词早于实际进度约 1 秒出现。
+ *  3. 新增 LEAD_MS 提前量：喂给官方引擎的位置 = 实际位置 + 2000ms（v1.3.8 起），
+ *     使状态栏歌词早于实际进度约 2 秒出现。
+ *  4. B 方案（v1.3.8）：每次主查询拿到 nextEventPos（下一行绝对位置）后，立刻对
+ *     nextEventPos 再做一次只读探测调用，缓存「下一行文本 + 下一行开始时间」，
+ *     调度直接锚定 nextLineStart - LEAD_MS，比单纯依赖 postDelayed 估算更稳，
+ *     且为将来双行/过渡动画预留了下一行数据。
  *
  * 【关键突破（v1.3.1）】
  *  拆包发现 getLinesAtPosition 在整个宿主 Java 层零调用——它是 JavaCPP
@@ -74,9 +78,9 @@ object BackgroundLyrics {
      * 歌词提前量（毫秒）。喂给官方引擎的位置 = 实际播放位置 + LEAD_MS，
      * 等于把歌词时间轴整体往前拨，使状态栏歌词早于实际进度出现，
      * 抵消状态栏 ticker 的渲染/合成延迟，观感上"歌词先到、人声后到"。
-     * v1.3.7 起从 400ms 提升到 1000ms，实现"提前 1 秒推下一行"的需求。
+     * v1.3.8 起从 1000ms 提升到 2000ms，实现"提前 2 秒推下一行"的需求（B 方案）。
      */
-    private const val LEAD_MS = 1000L
+    private const val LEAD_MS = 2000L
 
     private const val CLS_TIME_PROCESSOR =
         "com.apple.android.music.ttml.SongInfoTimeProcessor"
@@ -108,8 +112,10 @@ object BackgroundLyrics {
     // ─── processEvents 反射缓存 ───
     private var timeProcessor: Any? = null
     private var processMethod: Method? = null
-    /** 5 个歌词事件回调（宿主 OnLineEventCallback FunctionPointer 实例，内部包着我们的 SAM 代理） */
+    /** 5 个歌词事件回调（显示用：line 触发即上屏当前行） */
     private var eventCallbacks: Array<Any>? = null
+    /** 5 个歌词事件回调（静默探测用：line 触发只缓存文本，不上屏） */
+    private var peekCallbacks: Array<Any>? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -119,6 +125,19 @@ object BackgroundLyrics {
     /** processEvents 返回的自适应延迟（下次 tick 间隔） */
     @Volatile
     private var nextDelay: Long = POLL_INTERVAL_MS
+
+    // ─── B 方案：下一行缓存（时间戳精准调度） ───
+    /** 下一行文本缓存（只读探测得到，不用于显示，仅供将来双行/过渡） */
+    @Volatile
+    private var nextLineText: String? = null
+    /** 下一行绝对开始时间戳(ms)，由主查询的 nextEventPos 提供 */
+    @Volatile
+    private var nextLineStart: Long = -1L
+    /** 当前已上屏文本，用于去重，避免同一行被重复推送 */
+    @Volatile
+    private var displayedText: String? = null
+    /** 探测调用临时承接变量（单线程 handler，调用后即读即清） */
+    private var peekedText: String? = null
 
     private val tick: Runnable = object : Runnable {
         override fun run() {
@@ -139,6 +158,10 @@ object BackgroundLyrics {
                 currentSongKey = key
                 songPtr = null
                 songPtrKey = null
+                // B 方案：切歌重置下一行缓存与去重标记
+                nextLineText = null
+                nextLineStart = -1L
+                displayedText = null
                 LyricController.onSongChanged(key)
                 XLog.d("song key -> $key (storeId=$storeId)")
             }
@@ -202,6 +225,9 @@ object BackgroundLyrics {
         playing = false
         songPtr = null
         songPtrKey = null
+        nextLineText = null
+        nextLineStart = -1L
+        displayedText = null
         LyricsLoader.resetSession()
     }
 
@@ -262,31 +288,48 @@ object BackgroundLyrics {
                 nextDelay = POLL_INTERVAL_MS
                 return
             }
-            val cbs = eventCallbacks ?: run {
-                XLog.w("processEvents: callbacks null")
+            val dcbs = eventCallbacks ?: run {
+                XLog.w("processEvents: display callbacks null")
+                nextDelay = POLL_INTERVAL_MS
+                return
+            }
+            val pcbs = peekCallbacks ?: run {
+                XLog.w("processEvents: peek callbacks null")
                 nextDelay = POLL_INTERVAL_MS
                 return
             }
 
-            // 与播放界面完全相同的官方驱动：processEvents(ptr, pos, line, word, bgWord, prWord, prBgWord)
-            // 传入 queryPos（= pos + LEAD_MS）实现歌词提前上屏。
-            //
-            // 【v1.3.6 关键：返回值语义纠正】
-            //  真机日志实测证明返回值【不是"距下一事件的延迟"，而是"下一歌词事件的
-            //  绝对位置(ms)"】：pos 从 720→5746→15753 递增时返回值恒为 17013，
-            //  直到 queryPos 越过 17013 才推行并跳到下一行的 23500。
-            //  误当成延迟用会造成：
-            //   · clamp 到 5000（v1.3.3）→ 变成 5s 盲轮询，每行随机滞后 0~5s；
-            //   · 放开上限（v1.3.4）→ 一次挂 17~43s，后台被系统压制 → 完全停更。
-            //  正确换算：delay = nextEventPos - queryPos，再用 MAX 心跳护栏兜住。
-            val nextEventPos = m.invoke(tp, ptr, queryPos, cbs[0], cbs[1], cbs[2], cbs[3], cbs[4]) as? Long
+            // 1. 主查询：驱动显示当前行（display 回调上屏），并取回下一行绝对位置。
+            //    返回值 nextEventPos = 下一歌词事件的绝对位置(ms)（v1.3.6 语义纠正）。
+            val nextEventPos = m.invoke(tp, ptr, queryPos, dcbs[0], dcbs[1], dcbs[2], dcbs[3], dcbs[4]) as? Long
+
+            // 2. B 方案：对 nextEventPos 再做一次只读探测，缓存下一行文本 + 时间戳。
+            //    探测用独立的静默回调（pcbs）——只承接文本、不上屏，不影响播放器 UI。
+            //    我们的 timeProcessor 是独立 new 出来的实例，探测不污染播放器自身引擎。
+            if (nextEventPos != null && nextEventPos > queryPos) {
+                peekedText = null
+                m.invoke(tp, ptr, nextEventPos, pcbs[0], pcbs[1], pcbs[2], pcbs[3], pcbs[4])
+                nextLineText = peekedText
+                nextLineStart = nextEventPos
+            } else {
+                nextLineText = null
+                nextLineStart = -1L
+            }
+
+            // 3. 调度：直接锚定「下一行开始时间 - 提前量」计算下次 tick 间隔。
+            //    B 方案已显式持有 nextLineStart（= 下一行真实时间戳），比 (nextEventPos - queryPos)
+            //    估算更直白，且在 seek/系统压制导致错过精确 tick 时，下一 tick 会用真实 pos 重新校准。
             nextDelay = when {
                 nextEventPos == null -> POLL_INTERVAL_MS
                 // 已无后续事件（歌词播完/无歌词）：退回心跳频率，避免 100ms 空转
                 nextEventPos <= queryPos -> MAX_DELAY_MS
-                else -> (nextEventPos - queryPos).coerceIn(MIN_DELAY_MS, MAX_DELAY_MS)
+                else -> {
+                    val switchDelay = nextLineStart - LEAD_MS - pos
+                    if (switchDelay <= 0L) MIN_DELAY_MS
+                    else switchDelay.coerceIn(MIN_DELAY_MS, MAX_DELAY_MS)
+                }
             }
-            XLog.d("processEvents nextPos=$nextEventPos delay=$nextDelay (pos=$pos q=$queryPos)")
+            XLog.d("processEvents nextPos=$nextEventPos delay=$nextDelay nextText=[$nextLineText] nextStart=$nextLineStart (pos=$pos q=$queryPos)")
         }.onFailure {
             XLog.w("processEvents failed: ${it.message}")
             nextDelay = POLL_INTERVAL_MS
@@ -309,7 +352,7 @@ object BackgroundLyrics {
      *      其余 no-op；直接作为 5 个回调传给 processEvents —— 与播放界面同一条原生路径。
      */
     private fun ensureProcessor() {
-        if (timeProcessor != null && processMethod != null && eventCallbacks != null) return
+        if (timeProcessor != null && processMethod != null && eventCallbacks != null && peekCallbacks != null) return
         val cl = classLoader ?: run {
             XLog.w("ensureProcessor: classLoader null")
             return
@@ -336,21 +379,35 @@ object BackgroundLyrics {
                 .firstOrNull { it.name !in setOf("equals", "hashCode", "toString") }?.name ?: "invoke"
             XLog.d("lyrics callback SAM: ${samInterface.name}#$samMethod")
 
-            // 3. 直接构造 5 个 g.q 代理：第 0 个（line 回调）抽文本，其余 no-op
+            // 3. 直接构造两套各 5 个 g.q 代理：
+            //    · displayCbs —— 第 0 个（line 回调）抽文本并上屏，同时记 displayedText 去重；
+            //    · peekCbs    —— 第 0 个（line 回调）只把文本缓存到 peekedText，不上屏。
             //    processEvents 参数顺序：line, word, bgWord, prWord, prBgWord
-            val callbacks = Array(5) { idx ->
+            val displayCbs = Array(5) { idx ->
                 Proxy.newProxyInstance(samInterface.classLoader, arrayOf(samInterface)) { _, method, args ->
                     if (idx == 0 && method.name == samMethod && args != null && args.size >= 2) {
-                        // args[0]=位置, args[1]=歌词行向量, args[2]=时间戳
                         val text = NativeLyricsParser.extractLineText(args[1])
                         XLog.d("cbInvoke ${method.name} n=${args.size} a1=${args[1]?.javaClass?.name} txt=[$text]")
-                        if (text != null) LyricController.onLyricLine(text)
+                        if (text != null) {
+                            LyricController.onLyricLine(text)
+                            displayedText = text
+                        }
                     }
                     null
                 }
             }
-            eventCallbacks = callbacks
-            XLog.i("lyrics callbacks ready (${eventCallbacks?.size})")
+            val peekCbs = Array(5) { idx ->
+                Proxy.newProxyInstance(samInterface.classLoader, arrayOf(samInterface)) { _, method, args ->
+                    if (idx == 0 && method.name == samMethod && args != null && args.size >= 2) {
+                        val text = NativeLyricsParser.extractLineText(args[1])
+                        if (text != null) peekedText = text
+                    }
+                    null
+                }
+            }
+            eventCallbacks = displayCbs
+            peekCallbacks = peekCbs
+            XLog.i("lyrics callbacks ready (display=${eventCallbacks?.size}, peek=${peekCallbacks?.size})")
             XLog.i("processEvents method ready")
 
         }.onFailure {
