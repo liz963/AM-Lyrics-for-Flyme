@@ -16,7 +16,7 @@
 - 实时逐行歌词注入 Flyme 状态栏，与播放进度精准对齐（触发误差 < 100ms）；
 - **播放即加载**：开始播放任意歌曲后立即主动调用取词接口，无需进入播放界面；
 - **切到后台持续滚动**：通过官方歌词引擎反射驱动，离开播放界面 / 锁屏 / 切到桌面都不断更；
-- **歌词提前上屏**：状态栏歌词比实际人声进度提前约 `1200ms`（1.2 秒），抵消状态栏 ticker 渲染延迟（观感"歌词先到、人声后到"）；
+- **歌词提前上屏**：状态栏歌词比实际人声进度提前约 `1000ms`（1 秒），抵消状态栏 ticker 渲染延迟（观感"歌词先到、人声后到"）；
 - **移除状态栏左侧音符图标**：仅保留歌词文本（`ticker_icon_switch = false`）；
 - 同时支持在线歌词与本地 LRC 歌词（`LrcParser`）。
 
@@ -52,7 +52,7 @@ Apple Music 进程
 
 - `processEvents(ptr, positionMs, lineCb, wordCb, bgWordCb, prWordCb, prBgWordCb)` 的
   返回值**不是延迟，而是「下一歌词事件的绝对位置(ms)」**。换算为下次轮询间隔：
-  `delay = nextEventPos − queryPos`，其中 `queryPos = 实际位置 + LEAD_MS(1200)` 实现提前量。
+  `delay = nextEventPos − queryPos`，其中 `queryPos = 实际位置 + LEAD_MS(1000)` 实现提前量。
 - **B 方案（v1.3.8）下一行探测**：每次主查询拿到 `nextEventPos`（下一行绝对位置）后，立刻对
   `nextEventPos` 再做一次**只读探测调用**，缓存「下一行文本 + 下一行开始时间戳」。调度不再单纯依赖
   `processEvents` 的估算延迟，而是直接锚定 `nextLineStart − LEAD_MS`，在「下一行应出现的时间 − 2 秒」
@@ -62,7 +62,7 @@ Apple Music 进程
   至少醒一次读进度、感知切歌 / seek（这是后台持续滚动的关键，长时挂起会导致后台停更）。
 - 5 个回调里只处理 `line` 事件抽文本（其余按 no-op 处理），与播放界面走完全相同的原生路径。
 
-## 一、Hook 点（v1.3.9 逆向定位依据）
+## 一、Hook 点（v1.3.10 逆向定位依据）
 
 | # | Hook 目标 | 用途 |
 |---|-----------|------|
@@ -73,14 +73,14 @@ Apple Music 进程
 | 5 | `com.apple.android.music.playback.controller.LocalMediaPlayerController.onPlaybackStateChanged`（3 参，末参 int） | 播放状态：`0=停止 1=播放 2=暂停` + 控制器实例捕获 |
 | 6 | `android.app.NotificationManager.notify` / `cancel` | 载波模式：歌词 Ticker 注入宿主媒体通知 |
 
-**歌词数据提取链**（`NativeLyricsParser.kt`，全部走反射、逐步判空）：
+**歌词数据提取**（`NativeLyricsParser.kt`，全部走反射、逐步判空）：
 
-```
-SongInfoPtr → Song.getSections() → Section.getLines()
-  Line.getBegin() / getEnd()   → 行起止时间（毫秒）
-  Line.getHtmlLineText()       → 歌词文本（含 HTML，需清洗）
-  Line.getHtmlTranslationLineText() → 翻译文本
-```
+- 当前行文本由官方引擎 `processEvents` 的逐行回调直接给出（回调参数携带 `LyricsLineVector`），
+  再由 `extractLineText()` 反射读取 `getHtmlLineText()`（含翻译行则用 `getHtmlTranslationLineText()`，
+  以 ` · ` 连接），并做 HTML 清洗；
+- **5.2.0 的逐行时间戳不由模型暴露**（`LyricsLineNative` 没有 `getBegin/getEnd`），时间由
+  `SongInfoTimeProcessor` 在播放时实时计算（见上文「驱动机制要点」），因此歌词时间轴不在此处解析；
+- 有无歌词判断：`SongInfoPtr → get() → getSections()`，`size() > 0` 即含歌词。
 
 原生容器的统一特征：`size(): Long`、`get(i)` 返回智能指针包装、再 `.get()` 拿到原生对象。
 
@@ -202,11 +202,11 @@ adb logcat -s AMFlymeLyric
 ## 六、已知限制与路线图
 
 - 适配 Apple Music **5.2.0** 验证，大版本更新后需按 jadx 指南重定位（计划接入 DexKit 自动匹配）；
-- 翻译歌词默认关闭（`LyricController.SHOW_TRANSLATION`），状态栏宽度有限，开启后原文·译文同行显示；
 - Apple Music 无损 / 杜比全景声歌曲的歌词时间轴与普通曲目一致，无额外处理。
 
 ## 更新日志
 
+- **v1.3.10**：`LEAD_MS` 由 `1200ms` 回调到 `1000ms`（提前约 1 秒上屏，B 方案下一行探测调度不变）；README 删除不实内容（5.2.0 无 `getBegin/getEnd` 时间戳、无 `SHOW_TRANSLATION` 开关）。
 - **v1.3.9**：`LEAD_MS` 由 `2000ms` 回调到 `1200ms`（提前约 1.2 秒上屏，B 方案下一行探测调度不变）。
 - **v1.3.8**：B 方案「下一行探测 + 时间戳精准调度」；`LEAD_MS` 由 `1000ms` 提升至 `2000ms`（提前约 2 秒上屏）。
 - **v1.3.7**：歌词提前量 `LEAD_MS` 由 `400ms` 提升至 `1000ms`（状态栏歌词提前约 1 秒上屏）；调度逻辑不变。
