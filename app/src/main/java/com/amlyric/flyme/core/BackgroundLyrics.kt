@@ -146,6 +146,16 @@ object BackgroundLyrics {
     /** 本首歌是否已推送过「歌曲名-歌手名」(只在首次进歌推一次，循环/重头不重复推) */
     @Volatile
     private var titlePushed = false
+    /**
+     * 歌名锁定中：推完「歌曲名-歌手名」后置 true，期间**抑制歌词上屏**，
+     * 把标题稳定保持到「第一句歌词前 LEAD_MS」，再放开让第一句按原提前量准时出现。
+     * 否则官方引擎在前奏期会把第一句当活动行回传，把标题瞬间顶掉（"一闪而过"）。
+     */
+    @Volatile
+    private var titleHold = false
+    /** 本首歌第一句歌词的绝对时间戳(ms)；prelude 期由 nextLineStart 捕获，-1 表示未知（纯伴奏/尚未取到） */
+    @Volatile
+    private var firstLineMs = -1L
     /** 探测调用临时承接变量（单线程 handler，调用后即读即清） */
     private var peekedText: String? = null
 
@@ -174,6 +184,9 @@ object BackgroundLyrics {
                 displayedText = null
                 // 切歌：歌名推送标记复位（只在首次进这首歌推一次）
                 titlePushed = false
+                // 切歌：歌名锁定与第一句时间戳一并复位
+                titleHold = false
+                firstLineMs = -1L
                 LyricController.onSongChanged(key)
                 XLog.d("song key -> $key (storeId=$storeId)")
             }
@@ -245,8 +258,13 @@ object BackgroundLyrics {
         nextLineStart = -1L
         displayedText = null
         titlePushed = false
+        titleHold = false
+        firstLineMs = -1L
         LyricsLoader.resetSession()
     }
+
+    /** 歌名是否正处于锁定展示中（供 LyricController 抑制「暂无歌词」占位，保持歌名） */
+    fun isTitleHolding(): Boolean = titleHold
 
     /** 初始化（由 AppleMusicHooks 在 Application.attach 后调用） */
     fun init(cl: ClassLoader) {
@@ -284,7 +302,10 @@ object BackgroundLyrics {
 
         LyricController.onSongMeta(meta)
         titlePushed = true
-        XLog.d("song meta pushed at pos=$pos: $meta")
+        // 进入歌名锁定：抑制歌词上屏，直到第一句前 LEAD_MS 才放开（见 queryCurrentLine）
+        titleHold = true
+        firstLineMs = -1L
+        XLog.d("song meta pushed at pos=$pos: $meta (titleHold on)")
     }
 
     private fun ensurePolling() {
@@ -322,6 +343,12 @@ object BackgroundLyrics {
         val c = controller ?: return
         val pos = ReflectCompat.long(c, "getCurrentPosition")
         if (pos < 0L) return
+        // 歌名锁定释放：进度到达「第一句前 LEAD_MS」即放开，让第一句按原提前量准时上屏。
+        // 这时引擎的 queryPos 恰好 >= firstLineMs，第一句回调会在本次 invoke 内自然触发。
+        if (titleHold && firstLineMs > 0 && pos >= firstLineMs - LEAD_MS) {
+            titleHold = false
+            XLog.d("title hold released at pos=$pos (firstLineMs=$firstLineMs)")
+        }
         // 提前量：把喂给引擎的位置往前拨 LEAD_MS，歌词早于实际进度上屏
         val queryPos = pos + LEAD_MS
 
@@ -360,6 +387,11 @@ object BackgroundLyrics {
                 m.invoke(tp, ptr, nextEventPos, pcbs[0], pcbs[1], pcbs[2], pcbs[3], pcbs[4])
                 nextLineText = peekedText
                 nextLineStart = nextEventPos
+                // prelude 期 nextEventPos 就是第一句开始时间，捕获一次作为歌名锁定释放基准
+                if (titleHold && firstLineMs < 0) {
+                    firstLineMs = nextEventPos
+                    XLog.d("first line time captured: $firstLineMs")
+                }
             } else {
                 nextLineText = null
                 nextLineStart = -1L
@@ -368,7 +400,11 @@ object BackgroundLyrics {
             // 3. 调度：直接锚定「下一行开始时间 - 提前量」计算下次 tick 间隔。
             //    B 方案已显式持有 nextLineStart（= 下一行真实时间戳），比 (nextEventPos - queryPos)
             //    估算更直白，且在 seek/系统压制导致错过精确 tick 时，下一 tick 会用真实 pos 重新校准。
-            nextDelay = when {
+            //    歌名锁定中：用更密轮询（≤ POLL_INTERVAL_MS）贴近「第一句前 LEAD_MS」释放点，
+            //    否则会被 5s 心跳拖到过迟才放开歌名。
+            nextDelay = if (titleHold && firstLineMs > 0) {
+                (firstLineMs - LEAD_MS - pos).coerceIn(MIN_DELAY_MS, POLL_INTERVAL_MS)
+            } else when {
                 nextEventPos == null -> POLL_INTERVAL_MS
                 // 已无后续事件（歌词播完/无歌词）：退回心跳频率，避免 100ms 空转
                 nextEventPos <= queryPos -> MAX_DELAY_MS
@@ -436,8 +472,9 @@ object BackgroundLyrics {
                 Proxy.newProxyInstance(samInterface.classLoader, arrayOf(samInterface)) { _, method, args ->
                     if (idx == 0 && method.name == samMethod && args != null && args.size >= 2) {
                         val text = NativeLyricsParser.extractLineText(args[1])
-                        XLog.d("cbInvoke ${method.name} n=${args.size} a1=${args[1]?.javaClass?.name} txt=[$text]")
-                        if (text != null) {
+                        XLog.d("cbInvoke ${method.name} n=${args.size} a1=${args[1]?.javaClass?.name} txt=[$text] hold=$titleHold")
+                        // 歌名锁定中：抑制歌词上屏，保持「歌曲名-歌手」直到第一句前 LEAD_MS
+                        if (text != null && !titleHold) {
                             LyricController.onLyricLine(text)
                             displayedText = text
                         }

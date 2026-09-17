@@ -63,9 +63,10 @@ object LyricController {
     }
 
     /**
-     * 推送「歌曲名-歌手名」(v1.3.11 新功能)。
+     * 推送「歌曲名-歌手名」(v1.3.11 新功能，v1.3.12 起改为歌名锁定)。
      * 仅在播放最开头时由 BackgroundLyrics 调用一次：作为状态栏首条内容先露歌名，
-     * 随后第一句歌词上来时由 onLyricLine 自然替换。
+     * 随后 BackgroundLyrics 进入"歌名锁定"抑制歌词上屏，直到第一句前 LEAD_MS 才放开，
+     * 第一句按原提前量准时替换歌名。
      */
     @Synchronized
     fun onSongMeta(text: String?) {
@@ -87,6 +88,11 @@ object LyricController {
 
     @Synchronized
     fun onNoLyrics() {
+        // 歌名锁定中：保持「歌曲名-歌手」，不弹「暂无歌词」占位（纯伴奏场景下歌名贯穿整曲）
+        if (BackgroundLyrics.isTitleHolding()) {
+            XLog.d("onNoLyrics suppressed: title holding")
+            return
+        }
         if (noLyricHintShown) return
         noLyricHintShown = true
         FlymeStatusBarLyric.update("♪ 暂无歌词")
