@@ -8,7 +8,7 @@ import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 
 /**
- * 位置驱动歌词调度器 v6（v1.3.6 = v1.3.3 调度基线 + 返回值语义纠正 + 歌词提前量）。
+ * 位置驱动歌词调度器 v7（v1.3.7 = v1.3.6 基线 + LEAD_MS 由 400ms 提升到 1000ms，歌词提前 1 秒上屏）。
  *
  * 【v1.3.6 变更】
  *  1. 回滚 v1.3.4 的「取消延迟上限」改动 —— 该改动导致后台歌词完全停更；
@@ -16,8 +16,8 @@ import java.lang.reflect.Proxy
  *  2. 纠正 processEvents 返回值语义：它是【下一歌词事件的绝对位置(ms)】，
  *     不是延迟。换算 delay = nextEventPos - queryPos 后，既精准对齐官方
  *     进度（误差 < 100ms），又不会出现长时挂起。
- *  3. 新增 LEAD_MS 提前量：喂给官方引擎的位置 = 实际位置 + 400ms，
- *     使状态栏歌词略早于实际进度出现。
+ *  3. 新增 LEAD_MS 提前量：喂给官方引擎的位置 = 实际位置 + 1000ms（v1.3.7 起），
+ *     使状态栏歌词早于实际进度约 1 秒出现。
  *
  * 【关键突破（v1.3.1）】
  *  拆包发现 getLinesAtPosition 在整个宿主 Java 层零调用——它是 JavaCPP
@@ -74,8 +74,9 @@ object BackgroundLyrics {
      * 歌词提前量（毫秒）。喂给官方引擎的位置 = 实际播放位置 + LEAD_MS，
      * 等于把歌词时间轴整体往前拨，使状态栏歌词早于实际进度出现，
      * 抵消状态栏 ticker 的渲染/合成延迟，观感上"歌词先到、人声后到"。
+     * v1.3.7 起从 400ms 提升到 1000ms，实现"提前 1 秒推下一行"的需求。
      */
-    private const val LEAD_MS = 400L
+    private const val LEAD_MS = 1000L
 
     private const val CLS_TIME_PROCESSOR =
         "com.apple.android.music.ttml.SongInfoTimeProcessor"
