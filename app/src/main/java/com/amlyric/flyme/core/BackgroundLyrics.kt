@@ -89,6 +89,13 @@ object BackgroundLyrics {
      */
     private const val TITLE_PUSH_MAX_POS_MS = 1500L
 
+    /**
+     * 「回到开头」判定阈值(ms)。位置相对上一次 tick 大幅回退、且当前落在开头阈值内时，
+     * 判定为重播/拖回开头 → 重新武装歌名推送（v1.3.14）。
+     * 取 2000ms：正常播放位置只会单调前进，回退 2s 以上只可能是重播或 seek。
+     */
+    private const val RESTART_BACK_MS = 2000L
+
     private const val CLS_TIME_PROCESSOR =
         "com.apple.android.music.ttml.SongInfoTimeProcessor"
     private const val CLS_SONG_PTR =
@@ -156,8 +163,18 @@ object BackgroundLyrics {
     /** 本首歌第一句歌词的绝对时间戳(ms)；prelude 期由 nextLineStart 捕获，-1 表示未知（纯伴奏/尚未取到） */
     @Volatile
     private var firstLineMs = -1L
+    /** 本首歌第一句歌词文本；prelude 期由 peek 捕获。引擎对首句只回传一次且常在开头提前回传，
+     *  锁定期间被抑制后不会二次回传，故释放锁定时需手动补推一次，否则首句被吞。 */
+    @Volatile
+    private var firstLineText: String? = null
     /** 探测调用临时承接变量（单线程 handler，调用后即读即清） */
     private var peekedText: String? = null
+    /**
+     * 上一次 tick 读到的播放位置，用于识别「回到开头/重播」(v1.3.14)。
+     * -1 表示尚未取到（切歌后复位）。
+     */
+    @Volatile
+    private var lastPos: Long = -1L
 
     private val tick: Runnable = object : Runnable {
         override fun run() {
@@ -184,12 +201,17 @@ object BackgroundLyrics {
                 displayedText = null
                 // 切歌：歌名推送标记复位（只在首次进这首歌推一次）
                 titlePushed = false
-                // 切歌：歌名锁定与第一句时间戳一并复位
+                // 切歌：歌名锁定与第一句时间戳/文本一并复位
                 titleHold = false
                 firstLineMs = -1L
+                firstLineText = null
+                lastPos = -1L
                 LyricController.onSongChanged(key)
                 XLog.d("song key -> $key (storeId=$storeId)")
             }
+
+            // 新增：重播同一首 / 拖回开头 → 重新武装歌名推送（v1.3.14）
+            detectRestartToHead()
 
             // 新增：播放最开头时推送一次「歌曲名-歌手名」(放在 ptr 守卫之前，
             // 不依赖歌词句柄是否就绪，避免歌词未加载时错过开头窗口)
@@ -260,11 +282,61 @@ object BackgroundLyrics {
         titlePushed = false
         titleHold = false
         firstLineMs = -1L
+        firstLineText = null
         LyricsLoader.resetSession()
     }
 
     /** 歌名是否正处于锁定展示中（供 LyricController 抑制「暂无歌词」占位，保持歌名） */
     fun isTitleHolding(): Boolean = titleHold
+
+    /**
+     * 前台逐行回调的统一闸门（v1.3.14），由 AppleMusicHooks 的
+     * `SongInfoTimeProcessor.lineEventCallback.call` Hook 调用。
+     *
+     * 【为什么必须加这道闸门】
+     *  引擎在播放界面打开时会**自己**回调当前行，这条前台路径与后台驱动是两条独立的
+     *  上屏通路。v1.3.12/v1.3.13 只堵了后台驱动，前台路径漏网——真机实测
+     *  `hold=true` 期间 ticker 仍被首句覆盖（19:10:04.449 推歌名 → 19:10:05.982
+     *  首句就顶掉了），即用户反馈的"歌名一闪而过"。
+     *
+     * 【顺带捕获首句文本】
+     *  前奏期引擎会把「第一句」当活动行回传，这条路径拿到的文本最可靠
+     *  （真机实测后台 peek 偶尔给 null，见「泡沫」案例）。锁定期间把首个非空文本
+     *  记为首句，供释放锁定时补推，避免第一句被永久吞掉。
+     *
+     * @return true = 仍在歌名锁定中，调用方应抑制本次上屏；false = 正常放行。
+     */
+    fun onForegroundLine(text: String?): Boolean {
+        if (!titleHold) return false
+        if (firstLineText.isNullOrBlank() && !text.isNullOrBlank()) {
+            firstLineText = text
+            XLog.d("first line text captured (fg): [$text]")
+        }
+        return true
+    }
+
+    /**
+     * 识别「回到开头」（v1.3.14）：重播同一首 / 拖回进度 0 时，歌曲 key 不变，
+     * 原有的 titlePushed 会一直是 true，导致歌名不再推送。
+     * 位置上大幅回退且落在开头阈值内 → 复位歌名相关状态，下一 tick 重新推歌名并进入锁定。
+     */
+    private fun detectRestartToHead() {
+        val c = controller ?: return
+        val pos = ReflectCompat.long(c, "getCurrentPosition")
+        if (pos < 0L) return
+        val prev = lastPos
+        lastPos = pos
+        if (prev < 0L) return
+        if (prev > pos + RESTART_BACK_MS && pos <= TITLE_PUSH_MAX_POS_MS) {
+            // 重播/拖回开头：清空歌名与首句状态，重新武装（下一 tick maybePushSongTitle 会推歌名）
+            titlePushed = false
+            titleHold = false
+            firstLineMs = -1L
+            firstLineText = null
+            displayedText = null
+            XLog.d("restart to head detected (pos=$pos prev=$prev): title re-armed")
+        }
+    }
 
     /** 初始化（由 AppleMusicHooks 在 Application.attach 后调用） */
     fun init(cl: ClassLoader) {
@@ -343,12 +415,18 @@ object BackgroundLyrics {
         val c = controller ?: return
         val pos = ReflectCompat.long(c, "getCurrentPosition")
         if (pos < 0L) return
-        // 歌名锁定释放：进度到达「第一句前 LEAD_MS」即放开，让第一句按原提前量准时上屏。
-        // 这时引擎的 queryPos 恰好 >= firstLineMs，第一句回调会在本次 invoke 内自然触发。
-        if (titleHold && firstLineMs > 0 && pos >= firstLineMs - LEAD_MS) {
-            titleHold = false
-            XLog.d("title hold released at pos=$pos (firstLineMs=$firstLineMs)")
-        }
+            // 歌名锁定释放：进度到达「第一句前 LEAD_MS」即放开，让第一句按原提前量准时上屏。
+            // 引擎对首句只回传一次且常在开头提前回传，锁定期间被抑制后不会二次回传，
+            // 故释放时手动补推一次首句文本，避免第一句永久丢失。
+            if (titleHold && firstLineMs > 0 && pos >= firstLineMs - LEAD_MS) {
+                titleHold = false
+                if (!firstLineText.isNullOrBlank()) {
+                    LyricController.onLyricLine(firstLineText)
+                    displayedText = firstLineText
+                    XLog.d("first line re-pushed on release: [$firstLineText]")
+                }
+                XLog.d("title hold released at pos=$pos (firstLineMs=$firstLineMs)")
+            }
         // 提前量：把喂给引擎的位置往前拨 LEAD_MS，歌词早于实际进度上屏
         val queryPos = pos + LEAD_MS
 
@@ -390,7 +468,8 @@ object BackgroundLyrics {
                 // prelude 期 nextEventPos 就是第一句开始时间，捕获一次作为歌名锁定释放基准
                 if (titleHold && firstLineMs < 0) {
                     firstLineMs = nextEventPos
-                    XLog.d("first line time captured: $firstLineMs")
+                    firstLineText = peekedText
+                    XLog.d("first line time captured: $firstLineMs text=[$firstLineText]")
                 }
             } else {
                 nextLineText = null
@@ -477,6 +556,11 @@ object BackgroundLyrics {
                         if (text != null && !titleHold) {
                             LyricController.onLyricLine(text)
                             displayedText = text
+                        } else if (text != null && firstLineText.isNullOrBlank()) {
+                            // 锁定期间拿到首个非空文本 → 记为首句（前台路径未触发时的兜底，
+                            // 如后台播放/播放界面未打开），释放锁定时补推
+                            firstLineText = text
+                            XLog.d("first line text captured (bg): [$text]")
                         }
                     }
                     null

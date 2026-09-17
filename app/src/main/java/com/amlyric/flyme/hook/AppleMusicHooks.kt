@@ -72,7 +72,7 @@ object AppleMusicHooks {
                 installPlaybackHooks()
                 installNotificationHooks()
                 hookSettingsUI()
-                XLog.i("hooks installed (module v1.3.6)")
+                XLog.i("hooks installed (module 1.3.14)")
             }
         }
     }
@@ -154,6 +154,12 @@ object AppleMusicHooks {
                 // v1.3.0 起位置轮询与它走同一数据源，update() 按文本去重，互不冲突。
                 val lineVector = chain.args.getOrNull(1) ?: return@hookAfter
                 val text = NativeLyricsParser.extractLineText(lineVector)
+                // v1.3.14 关键修复：歌名锁定期间必须一并抑制这条前台路径。
+                // 引擎在播放界面打开时会自己回调当前行，前奏期它会把「第一句」
+                // 当活动行回传——真机实测按住锁定时 ticker 仍被首句顶掉，
+                // 这就是"歌名一闪而过"始终没修好的真正原因（此前只堵了后台驱动）。
+                // 同时借这条最可靠的路径捕获首句文本，供释放锁定时补推。
+                if (BackgroundLyrics.onForegroundLine(text)) return@hookAfter
                 LyricController.onLyricLine(text)
             }
         }
