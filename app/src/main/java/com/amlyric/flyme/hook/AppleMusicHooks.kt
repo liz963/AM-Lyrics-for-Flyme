@@ -1,45 +1,40 @@
 package com.amlyric.flyme.hook
 
-import android.app.Activity
 import android.app.Application
 import android.app.Notification
 import android.app.NotificationManager
 import android.content.Context
-import com.amlyric.flyme.Settings
 import com.amlyric.flyme.XLog
 import com.amlyric.flyme.flyme.FlymeStatusBarLyric
 import com.amlyric.flyme.core.BackgroundLyrics
 import com.amlyric.flyme.core.LyricController
+import com.amlyric.flyme.core.LyricsEngineDriver
 import com.amlyric.flyme.core.LyricsLoader
+import com.amlyric.flyme.lyric.LyricFetcher
+import com.amlyric.flyme.util.Reflect
 import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
-import java.lang.reflect.Proxy
 
 /**
- * Apple Music 5.2.0 Hook 层（libxposed API 102 拦截器链模型）。
+ * Apple Music Hook 层（libxposed API 102 拦截器链模型）。
  *
- * v1.3.6 Hook 清单：
+ * Hook 清单（v1.4.0）：
  *  1. Application.attach                      初始化入口
  *  2. PlayerLyricsViewModel.loadLyrics        UI 路径歌词加载（歌曲同步）
  *  3. PlayerLyricsViewModel.buildTimeRangeToLyricsMap  歌词句柄捕获（缓存 + 后台驱动数据源）
  *  4. SongInfoTimeProcessor.processEvents     反射驱动官方歌词引擎（无 UI/后台均逐行推送）
  *  5. LocalMediaPlayerController.onPlaybackStateChanged 播放状态 + 控制器捕获
  *  6. NotificationManager.notify/cancel       ★ 载波模式：歌词 Ticker 注入宿主媒体通知
- *  7. PreferenceFragmentCompat.setPreferenceScreen     设置页开关注入
+ *  7. SettingsFragment.onViewCreated          ★ 设置页注入（见 [SettingsInjector]，内含逆向后的事实）
+ *  8. PlayerLyricsViewFragment.I2             ★ 在线歌词注入（见 [LyricsInjector]）
+ *
+ * ⚠️ **原生歌词一律不碰**：宿主解析出来的歌词原样使用，不做任何改写。
+ * 制作名单行、`歌曲名 - 歌手` 尾注只针对**我们自己补来的第三方歌词**过滤
+ * （见 [com.amlyric.flyme.lyric.CreditLine]），入口在 [LyricController.onLyricLine]。
  */
 object AppleMusicHooks {
 
     const val TARGET_PACKAGE = "com.apple.android.music"
-
-    private const val PREF_KEY = Settings.KEY_LYRIC_ENABLED
-    private const val CLS_PREF_FRAG = "androidx.preference.PreferenceFragmentCompat"
-    private const val CLS_PREF_SCREEN = "androidx.preference.PreferenceScreen"
-
-    /** 「状态栏歌词」开关注入的宿主页面（主设置页 + 歌词设置页） */
-    private val SWITCH_HOST_ACTIVITIES = setOf(
-        "com.apple.android.music.settings.activity.SettingsActivity",
-        "com.apple.android.music.settings.activity.LyricsSettingsActivity"
-    )
 
     /** mediaStyle 通知在 extras 里携带 MediaSession token 的 key（framework 常量） */
     private const val EXTRA_MEDIA_SESSION = "android.mediaSession"
@@ -71,8 +66,12 @@ object AppleMusicHooks {
                 BackgroundLyrics.init(classLoader)
                 installPlaybackHooks()
                 installNotificationHooks()
-                hookSettingsUI()
-                XLog.i("hooks installed (module 1.3.17)")
+                SettingsInjector.install(xposed, classLoader)
+                TtmlBridge.init(classLoader)
+                TtmlBridge.selfTest { ptr, pos -> BackgroundLyrics.probeLineAt(ptr, pos) }
+                // 开发期链路自检（网络 + 解析 + TTML 落地），发版前把 SELF_CHECK 关掉
+                LyricFetcher.selfCheck()
+                XLog.i("hooks installed (module 1.4.0)")
             }
         }
     }
@@ -82,6 +81,7 @@ object AppleMusicHooks {
         hookLyricsBuild()      // 歌词句柄捕获 + 切歌 + 无歌词判定
         hookLineCallback()     // 引擎推当前行（前台）
         hookPlaybackState()    // 播放状态 + 控制器捕获（位置/当前曲目来源）
+        LyricsInjector.install(xposed, classLoader)  // 在线歌词注入（I2）
     }
 
     // ────────── 2a. UI 路径：歌词加载入口 ──────────
@@ -99,8 +99,8 @@ object AppleMusicHooks {
             hookAfter(method, "loadLyrics") { chain ->
                 val item = chain.args.firstOrNull()
                 val id = item?.let {
-                    ReflectCompat.string(it, "getId")
-                        ?: ReflectCompat.string(it, "getAdamId")
+                    Reflect.string(it, "getId")
+                        ?: Reflect.string(it, "getAdamId")
                 }
                 // UI 路径已发起加载：同步歌曲标识，并防止无 UI 加载器重复请求同一首
                 LyricController.onLyricsLoaded(id)
@@ -130,9 +130,8 @@ object AppleMusicHooks {
                     lastSongId = adamId
                     LyricController.onSongChanged(adamId)
                 }
-                if (!com.amlyric.flyme.hook.NativeLyricsParser.hasLyrics(ptr)) {
-                    LyricController.onNoLyrics()
-                }
+                // v1.4.0：无歌词时不再弹「♪ 暂无歌词」占位——前奏期闸门会让状态栏保持空白，
+                // 无歌词的歌曲自然一直空白（用户要求"不推送任何内容"）。
             }
         }
     }
@@ -150,6 +149,15 @@ object AppleMusicHooks {
             XLog.i("hook OK: lineEventCallback.call")
 
             hookAfter(method, "lineEventCallback.call") { chain ->
+                // ★ 先分辨"这次回调是谁引起的"。
+                // 宿主把行回调包了一层自己的 lambda（就是这个类），**按类**挂 Hook 就意味着
+                // **我们自己在反射调用 processEvents 时它也会触发**。不分辨的后果（真机实测）：
+                //  ① 开机自检的样例歌词 `自检歌词`/`第二句啊` 被当歌词推到状态栏
+                //     （旧版还会因此发一条写着歌词的通知）；
+                //  ② 为了算"下一跳时间"做的只读探测，会把**下一句提前推**出去。
+                // 我们驱动时行事件由 LyricsEngineDriver 的 display 回调负责，这里整条跳过。
+                if (LyricsEngineDriver.isInvoking) return@hookAfter
+
                 // 引擎逐行回调（播放界面打开时的精确时机驱动）。
                 // v1.3.0 起位置轮询与它走同一数据源，update() 按文本去重，互不冲突。
                 val lineVector = chain.args.getOrNull(1) ?: return@hookAfter
@@ -188,7 +196,6 @@ object AppleMusicHooks {
     }
 
     // ─────────────── 5. 载波模式：拦宿主通知，注入歌词 Ticker ───────────────
-
     /**
      * 拦 NotificationManager.notify：识别宿主的 MediaStyle 媒体通知，
      * 在提交前把歌词 Ticker（+ Flyme 扩展 flags/图标）注入进去。
@@ -249,83 +256,7 @@ object AppleMusicHooks {
                 (n.flags and Notification.FLAG_ONGOING_EVENT) != 0
     }
 
-    // ───────────── 6. 在 Apple Music 设置页注入「状态栏歌词」开关 ─────────────
-
-    private fun hookSettingsUI() {
-        runHook("SettingsUI inject") {
-            val fragClass = classLoader.loadClass(CLS_PREF_FRAG)
-            val screenClass = classLoader.loadClass(CLS_PREF_SCREEN)
-            val setScreen = fragClass.getDeclaredMethod("setPreferenceScreen", screenClass)
-            XLog.i("hook OK: settingsUI.setPreferenceScreen")
-
-            hookAfter(setScreen, "settingsUI.setPreferenceScreen") { chain ->
-                val fragment = chain.thisObject ?: return@hookAfter
-                val screen = chain.args.firstOrNull() ?: return@hookAfter
-                injectSwitch(fragment, screen)
-            }
-        }
-    }
-
-    private fun injectSwitch(fragment: Any, screen: Any) {
-        val fragClass = runCatching { classLoader.loadClass(CLS_PREF_FRAG) }.getOrNull() ?: return
-        if (!fragClass.isInstance(fragment)) return
-
-        val act = runCatching {
-            fragment.javaClass.getMethod("getActivity").invoke(fragment) as? Activity
-        }.getOrNull() ?: return
-        val actName = act.javaClass.name
-        if (actName !in SWITCH_HOST_ACTIVITIES) return
-
-        val screenClass = screen.javaClass
-
-        val existing = runCatching {
-            screenClass.getMethod("findPreference", CharSequence::class.java)
-                .invoke(screen, PREF_KEY)
-        }.getOrNull()
-        if (existing != null) return
-
-        val ctx = runCatching {
-            fragment.javaClass.getMethod("getContext").invoke(fragment) as? Context
-        }.getOrNull() ?: act
-
-        runCatching {
-            val switchClass = classLoader.loadClass("androidx.preference.SwitchPreference")
-            val prefClass = classLoader.loadClass("androidx.preference.Preference")
-            val listenerClass =
-                classLoader.loadClass("androidx.preference.Preference\$OnPreferenceChangeListener")
-            val sw = switchClass.getConstructor(Context::class.java).newInstance(ctx)
-
-            switchClass.getMethod("setKey", String::class.java).invoke(sw, PREF_KEY)
-            switchClass.getMethod("setTitle", CharSequence::class.java).invoke(sw, "状态栏歌词")
-            switchClass.getMethod("setSummary", CharSequence::class.java)
-                .invoke(sw, "在 Flyme 状态栏显示当前播放歌词")
-            switchClass.getMethod("setChecked", Boolean::class.javaPrimitiveType)
-                .invoke(sw, Settings.enabled)
-            switchClass.getMethod("setOrder", Int::class.javaPrimitiveType).invoke(sw, 0)
-            switchClass.getMethod("setPersistent", Boolean::class.javaPrimitiveType)
-                .invoke(sw, false)
-
-            val proxy = Proxy.newProxyInstance(classLoader, arrayOf(listenerClass)) { _, method, args ->
-                if (method.name == "onPreferenceChange") {
-                    val nv = args?.getOrNull(1)
-                    val v = when (nv) {
-                        is Boolean -> nv
-                        is java.lang.Boolean -> nv.booleanValue()
-                        else -> true
-                    }
-                    Settings.setEnabled(v)
-                    if (!v) FlymeStatusBarLyric.clear()
-                    true
-                } else null
-            }
-            switchClass.getMethod("setOnPreferenceChangeListener", listenerClass).invoke(sw, proxy)
-
-            screenClass.getMethod("addPreference", prefClass).invoke(screen, sw)
-            XLog.i("settings switch injected into $actName")
-        }.onFailure {
-            XLog.w("inject settings switch failed: ${it.message}")
-        }
-    }
+    // ─────────────────── 6. 设置页注入 → 见 SettingsInjector ───────────────────
 
     // ─────────────────────── hook 工具（拦截器链模型） ───────────────────────
 
@@ -352,24 +283,5 @@ object AppleMusicHooks {
         runCatching(block).onFailure {
             XLog.e("hook [$name] failed: ${it.message}", it)
         }
-    }
-}
-
-/** 轻量反射（宿主对象取值，失败一律返回 null） */
-private object ReflectCompat {
-    fun string(target: Any?, method: String): String? {
-        if (target == null) return null
-        return runCatching {
-            var cls: Class<*>? = target.javaClass
-            while (cls != null) {
-                val m = cls.declaredMethods.firstOrNull { it.name == method && it.parameterCount == 0 }
-                if (m != null) {
-                    m.isAccessible = true
-                    return@runCatching m.invoke(target) as? String
-                }
-                cls = cls.superclass
-            }
-            null
-        }.getOrNull()
     }
 }

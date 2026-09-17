@@ -27,35 +27,25 @@ import com.amlyric.flyme.util.Reflect
 object NativeLyricsParser {
 
     /**
-     * 从 LyricsLineVector 提取当前行文本。通常只有 1~2 行（主歌 + 可选的翻译/伴唱），
-     * 用 “ · ” 连接。所有原生访问逐步判空，任何异常安全返回 null。
+     * 从 LyricsLineVector 提取当前行文本 —— **只取主行，不取翻译**。
+     *
+     * 【为什么只取第 0 项（v1.4.0 用户明确要求）】
+     * 这个向量里可能不止一行：索引 0 是主歌词，后面还可能跟**翻译行**（以及发音行）。
+     * 早先的实现把所有行用 " · " 拼起来，结果状态栏会一起显示翻译
+     * （"残酷な天使のように · 就像那残酷的天使一样"）。用户要求状态栏**只推歌词本身**，
+     * 所以这里固定取第 0 项；第 0 项为空（间奏/纯音乐段）就返回 null 让上层保持上一句。
      */
     fun extractLineText(lineVector: Any?): String? {
         if (lineVector == null) return null
         val size = (Reflect.call(lineVector, "size") as? Long) ?: return null
         if (size <= 0 || size > 200) return null // 防御异常数据
-        val sb = StringBuilder()
-        for (i in 0 until size) {
-            val ptr = Reflect.call(lineVector, "get", i.toLong()) ?: continue
-            val native = Reflect.call(ptr, "get") ?: continue
-            val text = stripHtml(Reflect.call(native, "getHtmlLineText") as? String)
-            if (text.isNotEmpty()) {
-                if (sb.isNotEmpty()) sb.append(" · ")
-                sb.append(text)
-            }
-        }
-        return sb.toString().takeIf { it.isNotEmpty() }
+        val ptr = Reflect.call(lineVector, "get", 0L) ?: return null
+        val native = Reflect.call(ptr, "get") ?: return null
+        return stripHtml(Reflect.call(native, "getHtmlLineText") as? String)
+            .takeIf { it.isNotEmpty() }
     }
 
     /** 判断 SongInfoPtr 对应歌曲是否含有逐行歌词（段落数 > 0） */
-    fun hasLyrics(songInfoPtr: Any?): Boolean {
-        if (songInfoPtr == null) return false
-        val native = Reflect.call(songInfoPtr, "get") ?: return false
-        val sections = Reflect.call(native, "getSections") ?: return false
-        val size = (Reflect.call(sections, "size") as? Long) ?: 0L
-        return size > 0
-    }
-
     /** 取歌曲标识（adamId，Long 转 String），用于切歌去重 */
     fun adamId(songInfoPtr: Any?): String? {
         if (songInfoPtr == null) return null

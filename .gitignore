@@ -12,6 +12,7 @@ build*.log
 captures/
 # adb 真机调试采集的标签日志（调试产物，不入库）
 logcat_*.txt
+ui_settings.xml
 
 # ===== 签名密钥（机密，绝不入库） =====
 am-release.keystore

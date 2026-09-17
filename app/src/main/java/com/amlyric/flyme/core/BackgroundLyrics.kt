@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.amlyric.flyme.XLog
+import com.amlyric.flyme.hook.LyricsInjector
 import com.amlyric.flyme.hook.NativeLyricsParser
 import com.amlyric.flyme.util.Reflect
 
@@ -13,25 +14,32 @@ import com.amlyric.flyme.util.Reflect
  * ## 职责边界
  * 本类只负责「什么时候读位置、什么时候驱动引擎、下一跳隔多久」的编排。
  * 具体策略与实现下沉到两个协作组件，便于各自独立推理与修改：
- *  · [SongTitleGate]      —— 歌名展示闸门（歌名锁定 / 无歌词静默），纯状态机，不做外部动作；
+ *  · [LyricGate]          —— 前奏期闸门（纯状态机，只返回决策，不做外部动作）；
  *  · [LyricsEngineDriver] —— 官方引擎的反射驱动（processEvents 与回调代理）。
+ *
+ * ## 展示规则（v1.4.0 用户明确要求）
+ *  · **前奏期不推送任何内容**：从歌曲开头播放时，状态栏一直空白；
+ *  · 到「第一句歌词 − [LEAD_MS]」这一拍，放开闸门、第一句准时上屏；
+ *  · 中途起播 / 拖进度条：不做任何等待，歌词立刻跟上；
+ *  · 无歌词的歌曲：状态栏保持空白（不再推歌名、不再弹「暂无歌词」占位）。
  *
  * ## 驱动机制：用官方引擎 processEvents 逐行求值
  * `processEvents(ptr, positionMs, 5×callback)` 是播放界面 Fragment 驱动逐行歌词的官方入口：
  * 行事件 → 提取文本 → 上屏；**返回值是「下一歌词事件的绝对位置(ms)」**（v1.3.6 语义纠正）。
- * 所以调度不靠估算，而是锚定「下一行开始时间 − [LEAD_MS]」计算下一跳；
+ * 所以调度不靠估算，而是锚定「下一事件位置 − [LEAD_MS]」计算下一跳；
  * 同时保留 [MAX_DELAY_MS] 作为后台保活心跳（原因见该常量注释）。
  *
  * ## 提前量 LEAD_MS
  * 喂给引擎的位置 = 实际播放位置 + [LEAD_MS]（v1.3.10 起 1000ms），
  * 使歌词早于实际人声约 1 秒出现，抵消状态栏 ticker 的渲染/合成延迟。
+ * 同时它就是前奏期的放开基准（第一句前 1 秒）。
  *
  * ## ★ 两条上屏通路，必须共用同一把闸门（改上屏逻辑前必读）
  * 1. **本类的驱动**：display 回调收到行事件 —— 始终在位；
  * 2. **前台 Hook**：`AppleMusicHooks` 的 `lineEventCallback` —— 播放界面打开时引擎自己回调。
  *
  * v1.3.12/v1.3.13 只堵了 ①，② 无条件上屏，于是前奏期第一句把刚推的歌名顶掉，
- * 用户看到的就是"歌名一闪而过"。现两条通路都经 [SongTitleGate.blocksLyricLines] 判断
+ * 用户看到的就是"歌名一闪而过"。现两条通路都经 [LyricGate.isHolding] 判断
  * （② 走 [onForegroundLine]）。**任何新增的上屏/抑制逻辑都要两边同时考虑。**
  *
  * ## 线程模型
@@ -69,43 +77,69 @@ object BackgroundLyrics {
      * 歌词提前量(ms)：喂给引擎的位置 = 实际位置 + LEAD_MS。
      * 相当于把歌词时间轴整体前拨，观感上"歌词先到、人声后到"。
      * v1.3.10 起由 1200ms 回调到 1000ms（提前约 1 秒）。
-     * 同时被 [SongTitleGate] 用作歌名锁定的释放基准（第一句前 1 秒释放）。
+     * 同时被 [LyricGate] 用作前奏期的放开基准（第一句前 1 秒放开）。
      */
     private const val LEAD_MS = 1000L
 
     /** 形如纯数字的歌曲标识（storeId / adamId）——用于陈旧句柄校验 */
     private val DIGITS_ONLY = Regex("^\\d+$")
 
+    /**
+     * 「原生歌词缺失」的判定宽限期(ms)。
+     *
+     * 刚切歌时宿主自己的取词还在路上，句柄必然还没到；不等一会儿就断言"缺失"，
+     * 会给每一首歌都白跑一次在线请求——而这与用户要求相悖（只在确实缺时才请求）。
+     * 宿主正常 1~2 秒内就能拿到句柄，3 秒足够且不会让用户觉得"歌词怎么不来了"。
+     */
+    private const val ONLINE_GRACE_MS = 3000L
+
     // ═══════════════════════ 会话 / 播放器状态 ═══════════════════════
 
     /** 播放器控制器（LocalMediaPlayerController，由 onPlaybackStateChanged 捕获） */
     @Volatile private var controller: Any? = null
 
-    /** 仅用于控制「是否发起取词请求」与「是否推歌名」；显示驱动不依赖它 */
+    /** 仅用于控制「是否发起取词请求」与轮询频率；显示驱动不依赖它 */
     @Volatile private var playing = false
 
     /** 当前歌曲 key（来自 getCurrentItem，无 UI 也有效） */
     @Volatile private var currentSongKey: String? = null
 
+    /** 当前歌开始的时间戳（elapsedRealtime），用于 [ONLINE_GRACE_MS] 宽限判定 */
+    @Volatile private var songStartedAt: Long = 0L
+
+    /**
+     * 已经做过一次「该不该在线补全」判定的句柄（按对象身份去重）。
+     * 这条判定要反射读 timing / language / translation，每 tick 都做没必要；
+     * 同一首歌的句柄不变时只判一次即可。
+     */
+    @Volatile private var completionEvaluatedPtr: Any? = null
+
+    /**
+     * 已经做过判定的"无句柄"歌曲 key（见 [requestOnlineCompletion]）。
+     *
+     * 【为什么光有 [completionEvaluatedPtr] 不够】宿主确实没有歌词的歌（尤其伴奏轨）
+     * **永远不会有句柄**，于是每 tick 都会重新走一遍判定与日志 —— 真机实测每秒一条
+     * 「不补 —— 伴奏/纯音乐轨」。按歌曲 key 去重后，每首歌只判一次。
+     */
+    @Volatile private var completionEvaluatedSong: String? = null
+
     /** 当前歌曲的歌词句柄（强引用持有，保证原生 shared_ptr 不被释放） */
     @Volatile private var songPtr: Any? = null
-
-    // ═══════════════════ B 方案：下一行缓存（时间戳精准调度） ═══════════════════
 
     /**
      * 引擎报出的下一个事件位置(ms)，由主查询的返回值提供；-1 = 未知。
      *
      * ⚠️ 它**不是「下一行开始时间」**——实测该返回值可以是**行内字级事件**
      * （`nextEventPos - queryPos` 只有 2~900ms，且 `peek` 返回 null）。
-     * 因此只允许用作**唤醒节奏的锚点**，绝不能当作语义时间使用；
-     * 首句时间必须另加护栏（见 [SongTitleGate.MIN_TITLE_MS] 与 [noteFirstLineTime]）。
+     * 因此只允许用作**唤醒节奏的锚点**，绝不能当作语义时间使用。
+     * （首句时间用的是同一个返回值，但只在"前奏期"这个特定窗口采信，见 [LyricGate.noteFirstLineTime]）
      */
     @Volatile private var nextEventAt: Long = -1L
 
     // ═══════════════════════════ 协作组件 ═══════════════════════════
 
-    /** 歌名展示闸门（歌名锁定 / 无歌词静默） */
-    private val titleGate = SongTitleGate(LEAD_MS)
+    /** 前奏期闸门 */
+    private val gate = LyricGate(LEAD_MS)
 
     /** 官方引擎反射驱动；由 [init] 按宿主 ClassLoader 创建 */
     @Volatile private var engine: LyricsEngineDriver? = null
@@ -134,6 +168,19 @@ object BackgroundLyrics {
     }
 
     /**
+     * 诊断用：让官方引擎在 [posMs] 处求值并返回该处的行文本。
+     *
+     * 走的是 [LyricsEngineDriver.peek] 的**静默回调**——只承文本、不上屏，
+     * 也不会碰到播放页那个引擎实例，所以可以随时调用做链路自检。
+     */
+    fun probeLineAt(ptr: Any, posMs: Long): String? {
+        val drv = engine ?: return null
+        drv.ensureReady()
+        if (!drv.isReady) return null
+        return runCatching { drv.peek(ptr, posMs) }.getOrNull()
+    }
+
+    /**
      * 歌词句柄就绪（`LyricsLoader.onPtrCaptured` 或 `buildTimeRangeToLyricsMap` Hook 触发）。
      * 带陈旧性校验：切歌瞬间可能拿到上一首的句柄（实测偶发），此时直接丢弃。
      */
@@ -147,7 +194,9 @@ object BackgroundLyrics {
             XLog.d("stale ptr ignored: ptr=$adamId current=$key")
             return
         }
-        songPtr = ptr
+        // ★ 这首歌若已有"在线补全"结果，就让它胜出。
+        // 宿主会在我们补完后再次回传它自己那份（行级）歌词；不拦的话状态栏会退回原样。
+        songPtr = LyricsInjector.preferredPtr(key, ptr)
         ensurePolling()
     }
 
@@ -161,6 +210,11 @@ object BackgroundLyrics {
 
     /** 播放状态变化（仅控制取词请求与轮询频率，不影响显示驱动） */
     fun setPlaying(value: Boolean) {
+        // ★ 宽限期从"真的开始播"起算，而不是从"切歌"起算。
+        // 真机实测（v1.4.0）：启动时宿主会先恢复上次队列、切歌事件在第 1 秒就到了，
+        // 但真正开播要等十几秒；若按切歌起算，一开播宽限期就已满足，
+        // 于是"宿主还没取到歌词"被误判成"原生歌词缺失"，白白发了一次请求。
+        if (value && !playing) songStartedAt = SystemClock.elapsedRealtime()
         playing = value
         if (value) ensurePolling()
     }
@@ -170,29 +224,32 @@ object BackgroundLyrics {
         playing = false
         songPtr = null
         nextEventAt = -1L
-        titleGate.reset()
+        completionEvaluatedPtr = null
+        completionEvaluatedSong = null
+        gate.reset()
         LyricsLoader.resetSession()
     }
-
-    /** 歌名是否正处于锁定展示中（供 LyricController 抑制「暂无歌词」占位，保持歌名） */
-    fun isTitleHolding(): Boolean = titleGate.isHolding
 
     /**
      * 前台逐行回调的统一闸门，由 `AppleMusicHooks` 的
      * `SongInfoTimeProcessor.lineEventCallback.call` Hook 调用。
      *
      * 【为什么必须走这里】引擎在播放界面打开时会**自己**回调当前行，前奏期它会把
-     * 「第一句」当活动行回传 —— 不经过闸门就会顶掉刚推的歌名（"一闪而过"）。
+     * 「第一句」当活动行回传 —— 不经过闸门就会在前奏期提前把歌词顶上状态栏。
      * 详见类注释「两条上屏通路」。
      *
-     * 【顺带捕获首句文本】这条路径拿到的文本最可靠（后台探测偶发给 null，真机见"泡沫"案例）。
-     * 锁定期间把首个非空文本记为首句，供释放锁定时补推，避免第一句被永久吞掉。
+     * 【顺带捕获首句文本】这条路径拿到的文本最可靠（后台探测偶发给 null，真机见"泡沫"案例），
+     * 记下来供放开闸门时补推，避免第一句被永久吞掉。
      *
      * @return true = 应抑制本次上屏；false = 正常放行
      */
     fun onForegroundLine(text: String?): Boolean {
-        if (!titleGate.blocksLyricLines) return false
-        if (titleGate.noteFirstLineText(text)) XLog.d("first line text captured (fg): [$text]")
+        if (!gate.isHolding) return false
+        // 占位/版权行不算"第一句"：宿主在歌词没就绪时会回传 `歌曲名 - 歌手`，
+        // 把它记成首句会让前奏抑制提前放开（真机实测：日文歌在 1 秒处回传占位行，
+        // 闸门立刻放开，状态栏空等 20 秒才等到真正的第一句）。
+        if (LyricController.isNonLyricLine(text)) return true
+        if (gate.noteLineText(text)) XLog.d("first line text captured (fg): [$text]")
         return true
     }
 
@@ -201,20 +258,19 @@ object BackgroundLyrics {
     /**
      * 一个 tick 的全部工作，顺序固定：
      *  ① 读位置（本 tick 只读一次，供后续各判断复用）
-     *  ② 感知歌曲 → 检测回到开头 → 推歌名 → 取歌词句柄
-     *  ③ 歌名闸门裁决（释放锁定 / 无歌词兜底）
+     *  ② 感知歌曲 / 重播 → 武装前奏抑制 → 取歌词句柄
+     *  ③ 闸门裁决（放开前奏 / 补推第一句）
      *  ④ 驱动引擎并算出下一跳间隔
      */
     private fun onTick() {
         // 位置读不到（反射失败 / 播放器实例被回收）→ 本 tick 什么也不做。
         // ★ 不能用 0 兜底：0 与「真的回到开头」不可区分，会被 notePosition 误判为
-        // 「重播 / 拖回开头」而清掉歌名锁定，表现为歌名闪一下又没了（v1.3.16 修复）。
+        // 「重播 / 拖回开头」而反复复位闸门（v1.3.16 修复）。
         val posMs = readPositionMs() ?: return
 
         readCurrentMediaItem()?.let { onMediaItem(it, posMs) }
 
-        applyTitleGate(posMs)
-        keepHoldResponsive()
+        applyGate(posMs)
         driveEngine(posMs)
     }
 
@@ -225,49 +281,44 @@ object BackgroundLyrics {
 
         if (key != currentSongKey) {
             currentSongKey = key
+            songStartedAt = SystemClock.elapsedRealtime()
+            completionEvaluatedPtr = null
+            completionEvaluatedSong = null
             songPtr = null
             nextEventAt = -1L
-            titleGate.reset()
+            gate.reset()
             LyricController.onSongChanged(key)
             XLog.d("song key -> $key (storeId=$storeId)")
         }
 
-        // 重播同一首 / 拖回开头时歌曲 key 不变，须单独识别并重新武装歌名推送
-        if (titleGate.notePosition(posMs)) {
-            XLog.d("restart to head detected (pos=$posMs): title re-armed")
+        // 重播同一首 / 拖回开头时歌曲 key 不变，须单独识别并重新武装前奏抑制
+        if (gate.notePosition(posMs)) {
+            XLog.d("restart to head detected (pos=$posMs): prelude gate re-armed")
+        }
+        if (gate.armIfAtStart(posMs)) {
+            XLog.d("prelude gate armed at pos=$posMs: no output until first line - ${LEAD_MS}ms")
         }
 
-        pushSongTitleIfDue(item, posMs)
+        // 让控制器知道"当前歌是谁"：它要用歌名+歌手挡掉宿主回传的
+        // `歌曲名 - 歌手` 占位行（真机实测：歌词没就绪时宿主就是这么回传的）。
+        // 每个 tick 都同步一次，因为切歌那一刻 item 里的字段可能还没填好。
+        LyricController.onSongMeta(
+            Reflect.string(item, "getTitle"),
+            Reflect.string(item, "getArtistName"),
+        )
+
         acquireLyricsHandle(item, key, storeId)
-    }
-
-    /**
-     * 播放最开头时推一次「歌曲名 - 歌手名」。
-     *
-     * 判定用**位置**而非事件，天然覆盖「拖动进度条 / 跳播 / 中段续播」等非开头场景
-     * （这些情形 pos 明显大于阈值，直接走歌词、不推歌名）。
-     * 不依赖歌词句柄，故可先于取词执行，避免歌词未加载时错过开头窗口。
-     */
-    private fun pushSongTitleIfDue(item: Any, posMs: Long) {
-        if (!playing) return
-        if (!titleGate.canPushTitle(posMs)) return
-
-        val title = Reflect.string(item, "getTitle")
-        if (title.isNullOrBlank()) return
-        // 歌手名：真实 PlayerMediaItem 优先 getArtistName，拿不到再依次退而求其次
-        val artist = Reflect.string(item, "getArtistName")
-            ?: Reflect.string(item, "getArtist")
-            ?: Reflect.string(item, "getAlbumArtist")
-        val meta = if (artist.isNullOrBlank()) title else "$title - $artist"
-
-        LyricController.onSongMeta(meta)
-        titleGate.onTitlePushed(posMs, SystemClock.elapsedRealtime())
-        XLog.d("song meta pushed at pos=$posMs: $meta (titleHold on)")
     }
 
     /** 当前歌没有句柄：先查会话缓存，再主动取词 */
     private fun acquireLyricsHandle(item: Any, key: String, storeId: String?) {
-        if (songPtr != null) return
+        if (songPtr != null) {
+            // ★ 有句柄也可能"不合格"：非逐字时间轴、或外语逐字却没有翻译轨。
+            // 这两种正是用户要求补全的对象，且**不需要等待**——判据就在句柄里。
+            // 补全任务由 [LyricsInjector] 去重与执行，取好后经 onSongInfo 顶掉当前句柄。
+            requestOnlineCompletion(item, storeId, songPtr)
+            return
+        }
 
         val cached = LyricsLoader.cachedPtr(storeId)
         if (cached != null) {
@@ -278,48 +329,74 @@ object BackgroundLyrics {
         if (playing && storeId != null && storeId.matches(DIGITS_ONLY)) {
             LyricsLoader.requestLyrics(storeId, readQueueId(), Reflect.string(item, "getTitle"))
         }
-    }
 
-    /**
-     * 歌名闸门裁决（释放锁定 / 无歌词兜底）。
-     *
-     * 必须放在 [onTick] 而不是 [driveEngine] 里 —— 无歌词的歌曲**连句柄都没有**，
-     * [driveEngine] 会在拿到 `songPtr` 时立刻 return，永远走不到释放分支，
-     * 结果歌名会卡住整曲（v1.3.15 修复的正是这个）。
-     */
-    private fun applyTitleGate(posMs: Long) {
-        when (val decision = titleGate.evaluate(posMs, SystemClock.elapsedRealtime(), playing)) {
-            is SongTitleGate.Decision.Release -> {
-                val text = decision.firstLineText
-                // 引擎对首句只回传一次且常在开头提前回传，锁定期间被抑制后不会二次回传，
-                // 故释放时手动补推一次，否则第一句会被永久吞掉（v1.3.13）
-                if (!text.isNullOrBlank()) {
-                    LyricController.onLyricLine(text)
-                    XLog.d("first line re-pushed on release: [$text]")
-                }
-                val guard = decision.releaseAtMs - (decision.firstLineAtMs - LEAD_MS)
-                XLog.d(
-                    "title hold released at pos=$posMs (firstLineMs=${decision.firstLineAtMs} " +
-                        "releaseAt=${decision.releaseAtMs} guard=${if (guard > 0) "+$guard" else "off"})"
-                )
-            }
-
-            SongTitleGate.Decision.NoLyrics -> {
-                XLog.d("no lyrics: hold timed out -> clear ticker & stop pushing")
-                LyricController.onSilence()
-            }
-
-            SongTitleGate.Decision.None -> Unit
+        // ★ 兜底：等了 [ONLINE_GRACE_MS] 宿主还没给句柄，就按"原生歌词缺失"处理，自己去找。
+        // 之所以要等：宿主自己取词是异步的，刚切歌那一刻句柄必然还没到，
+        // 不等就会给每首歌都白跑一次请求——而用户明确要求只在"确实缺"的时候才请求。
+        if (playing && elapsedSinceSongStart() >= ONLINE_GRACE_MS) {
+            requestOnlineCompletion(item, storeId, null)
         }
     }
 
     /**
-     * 无歌词的歌曲**连句柄都没有**，[driveEngine] 在第一行就 return，永远不会设置 nextDelay，
-     * 于是「无歌词兜底」要等上一次遗留的 5s 心跳才被评估。这里显式压低。
-     * （有句柄时由 [nextDelayFor] 按 [SongTitleGate.pollTargetMs] 自行压低，无需在此处理。）
+     * 请求在线补全（是否需要 / 是否允许联网由 [LyricsInjector] 统一裁决）。
+     *
+     * 这里刻意**不接收返回值**：补全一般要几百毫秒，本 tick 用不上；
+     * 结果由注入器回主线程调 [onSongInfo] 落地，与"宿主自己捕获到 ptr"走完全相同的后续流程。
+     *
+     * ⚠️ 两个维度都要去重，否则判定会被每 tick 重复执行（日志刷屏、白反射）：
+     *  · 有句柄 → 按**句柄身份**（宿主重新解析会换句柄，那时该重判）；
+     *  · 无句柄 → 按**歌曲 key**（这类歌永远等不到句柄，只判一次）。
+     * 歌名还没读出来时直接返回，不记账 —— 否则会把"信息不全"错当成"已判定过"。
      */
-    private fun keepHoldResponsive() {
-        if (songPtr == null && titleGate.isHolding) nextDelay = POLL_INTERVAL_MS
+    private fun requestOnlineCompletion(item: Any, storeId: String?, nativePtr: Any?) {
+        val title = Reflect.string(item, "getTitle")
+        if (title.isNullOrBlank()) return
+
+        if (nativePtr != null) {
+            // 同一句柄只判一次（判定要反射读 timing/language/translation，没必要每 tick 重复）
+            if (nativePtr === completionEvaluatedPtr) return
+            completionEvaluatedPtr = nativePtr
+        } else {
+            val key = currentSongKey
+            if (key == null || key == completionEvaluatedSong) return
+            completionEvaluatedSong = key
+        }
+
+        LyricsInjector.completionFor(
+            storeId = storeId,
+            title = title,
+            artist = Reflect.string(item, "getArtistName"),
+            album = Reflect.string(item, "getCollectionName"),
+            durationMs = Reflect.long(item, "getPlaybackDuration"),
+            nativePtr = nativePtr,
+        )
+    }
+
+    /**
+     * 闸门裁决：前奏期是否放开、放开时补推第一句。
+     *
+     * 必须放在 [onTick] 而不是 [driveEngine] 里 —— 无歌词的歌曲**连句柄都没有**，
+     * [driveEngine] 会在拿到 `songPtr` 时立刻 return，永远走不到放开分支（v1.3.15 的教训）。
+     */
+    private fun applyGate(posMs: Long) {
+        when (val decision = gate.evaluate(posMs)) {
+            is LyricGate.Decision.Release -> {
+                // 引擎对首句只回传一次且常在开头提前回传，抑制期间被吞掉后不会二次回传，
+                // 故放开时手动补推一次，否则第一句会被永久吞掉（v1.3.13）
+                val text = decision.text
+                if (!text.isNullOrBlank()) {
+                    LyricController.onLyricLine(text)
+                    XLog.d("first line pushed on release: [$text]")
+                }
+                XLog.d(
+                    "prelude gate released at pos=$posMs " +
+                        "(firstLineMs=${decision.firstLineAtMs} bailOut=${decision.bailedOut})"
+                )
+            }
+
+            LyricGate.Decision.None -> Unit
+        }
     }
 
     /**
@@ -327,7 +404,7 @@ object BackgroundLyrics {
      *
      * ⚠️ `processEvents` 的返回值是**下一事件位置**，**不等于「下一行开始时间」**
      * （行内字级事件也会被报出来，实测提前量可小到 2ms）。所以它在这里只有两个用途：
-     * 算出唤醒节奏、给首句时间提供**候选**（候选本身另有护栏，见 [SongTitleGate]）。
+     * 算出唤醒节奏、给前奏期的首句时间提供**候选**（候选只在抑制窗口采信）。
      */
     private fun driveEngine(posMs: Long) {
         val ptr = songPtr ?: return
@@ -346,7 +423,8 @@ object BackgroundLyrics {
 
         val queryPos = posMs + LEAD_MS
         runCatching {
-            // ① 主查询：行事件经 display 回调上屏，返回值 = 下一事件绝对位置(ms)
+            // ① 主查询：行事件经 display 回调上屏（抑制期由 onEngineLine 拦下），
+            //    返回值 = 下一事件绝对位置(ms)
             val nextEventPos = drv.drive(ptr, queryPos)
             val nextEventIn = nextEventPos?.takeIf { it > queryPos }
 
@@ -355,18 +433,10 @@ object BackgroundLyrics {
             nextEventAt = nextEventIn ?: -1L
 
             if (nextEventIn != null) {
-                // ③ 锁定中首次拿到下一事件 → 记为首句时间候选。
-                //    prelude 期引擎会把第一句当活动行报出，那个候选就是第一句起点；
-                //    若句柄迟到（已进第一句内部）候选会退化成字级事件，此时由
-                //    SongTitleGate 的最短展示护栏兜底，不会闪。
-                if (titleGate.noteFirstLineTime(nextEventIn, nextText)) {
+                // ③ 前奏期首次拿到下一事件 → 它就是第一句起点
+                //    （前奏期还没进入第一句内部，不存在行内字级事件干扰）
+                if (gate.noteFirstLineTime(nextEventIn, nextText)) {
                     XLog.d("first line time captured: $nextEventIn text=[$nextText]")
-                }
-
-                // ④ 静默期间引擎又报出事件 → 歌词其实存在（只是加载慢），解除静默
-                if (titleGate.isSilent) {
-                    titleGate.clearSilence()
-                    XLog.d("no-lyrics silence lifted: engine reports event at $nextEventIn")
                 }
             }
 
@@ -383,15 +453,15 @@ object BackgroundLyrics {
 
     /**
      * 下一跳间隔。
-     *  · 歌名锁定中：密轮询（≤ [POLL_INTERVAL_MS]）贴近释放点，
-     *    否则会被 5s 心跳拖到过迟才放开歌名；
+     *  · 抑制中且已知首句时间：密轮询（≤ [POLL_INTERVAL_MS]）贴近放开点，
+     *    否则会被 5s 心跳拖到过迟才放开；
      *  · 无后续事件（歌词播完 / 无歌词）：退回心跳频率，避免空转；
      *  · 其余：锚定「下一事件位置 − [LEAD_MS]」。
      *
      * seek / 系统压制导致错过精确 tick 时，下一 tick 会用真实 position 重新校准。
      */
     private fun nextDelayFor(nextEventPos: Long?, queryPos: Long, posMs: Long): Long {
-        val pollTarget = titleGate.pollTargetMs
+        val pollTarget = gate.pollTargetMs
         if (pollTarget > 0) {
             return (pollTarget - posMs).coerceIn(MIN_DELAY_MS, POLL_INTERVAL_MS)
         }
@@ -408,14 +478,15 @@ object BackgroundLyrics {
 
     // ═══════════════════ 引擎回调（后台驱动路径的行事件） ═══════════════════
 
-    /** 按歌名闸门决定上屏 / 抑制 */
+    /** 按前奏闸门决定上屏 / 抑制 */
     private fun onEngineLine(text: String?) {
         if (text == null) return
 
-        if (titleGate.blocksLyricLines) {
-            // 锁定/静默中不上屏；顺手把首个非空文本记为首句
+        if (gate.isHolding) {
+            // 抑制中不上屏；顺手把首个非空文本记为首句
             // （前台路径未触发时的兜底，例如后台播放 / 播放界面没打开）
-            if (titleGate.noteFirstLineText(text)) {
+            // 占位/版权行同样不算首句（见 [LyricController.isNonLyricLine]）
+            if (!LyricController.isNonLyricLine(text) && gate.noteLineText(text)) {
                 XLog.d("first line text captured (bg): [$text]")
             }
             return
@@ -444,5 +515,13 @@ object BackgroundLyrics {
     private fun readQueueId(): Long {
         val queueItem = Reflect.call(controller, "getCurrentItem") ?: return 0L
         return Reflect.long(queueItem, "getPlaybackQueueId")
+    }
+
+    /**
+     * 当前歌已经播了多久（毫秒）。
+     * 未感知到歌曲时返回 0 → 宽限期不满足 → **不发请求**（宁可漏补也不乱补）。
+     */
+    private fun elapsedSinceSongStart(): Long = songStartedAt.let {
+        if (it == 0L) 0L else SystemClock.elapsedRealtime() - it
     }
 }
