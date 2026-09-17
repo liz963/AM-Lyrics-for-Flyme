@@ -74,15 +74,18 @@ object LyricController {
         FlymeStatusBarLyric.update(text)
     }
 
+    /**
+     * 宿主 UI 发起了取词（`PlayerLyricsViewModel.loadLyrics` Hook 触发）。
+     *
+     * ⚠️ **只记日志，绝不改任何显示状态**（v1.3.16 修正）。
+     * 该方法会在**歌曲真正切过去之前**就被调用（宿主会预加载下一首的歌词），
+     * 若在此处更新 [currentSongId]，随后的 [onSongChanged] 会因"id 未变"而提前返回，
+     * 于是**切歌清屏被跳过**——实测 14 首里 8 首如此，只是被"紧接着推歌名"掩盖，
+     * 一旦在暂停状态切歌就会看到上一首的歌词残留。
+     */
     @Synchronized
     fun onLyricsLoaded(songId: String?) {
-        // 仅同步歌曲标识（无 UI 加载兜底 + UI 路径都会走到这里），
-        // 不做任何占位显示。
-        if (songId != null && songId != currentSongId) {
-            currentSongId = songId
-            noLyricHintShown = false
-        }
-        XLog.d("lyrics loaded: $songId")
+        XLog.d("lyrics load requested by host: $songId")
     }
 
     @Synchronized
