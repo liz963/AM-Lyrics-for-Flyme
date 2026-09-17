@@ -20,6 +20,21 @@ object Reflect {
         }.getOrNull()
     }
 
+    /** 取字符串属性；拿不到（方法不存在 / 类型不符）返回 null */
+    fun string(target: Any?, method: String): String? = call(target, method) as? String
+
+    /**
+     * 取数值属性（兼容 Long/Int/其它 Number）；拿不到返回 0。
+     * 注意：返回值 0 与「真的取到 0」不可区分，调用方如需区分请自行用 [call] 判空。
+     */
+    fun long(target: Any?, method: String): Long =
+        when (val v = call(target, method)) {
+            is Long -> v
+            is Int -> v.toLong()
+            is Number -> v.toLong()
+            else -> 0L
+        }
+
     private fun findMethod(cls: Class<*>, name: String, argc: Int): Method? {
         var c: Class<*>? = cls
         while (c != null) {

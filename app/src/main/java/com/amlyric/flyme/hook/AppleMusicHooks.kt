@@ -72,7 +72,7 @@ object AppleMusicHooks {
                 installPlaybackHooks()
                 installNotificationHooks()
                 hookSettingsUI()
-                XLog.i("hooks installed (module 1.3.14)")
+                XLog.i("hooks installed (module 1.3.16)")
             }
         }
     }

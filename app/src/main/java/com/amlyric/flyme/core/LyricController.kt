@@ -29,7 +29,6 @@ object LyricController {
     private const val STATE_PAUSED = 2
 
     private var initialized = false
-    private var playing = false
     private var currentSongId: String? = null
     private var noLyricHintShown = false
 
@@ -98,25 +97,31 @@ object LyricController {
         FlymeStatusBarLyric.update("♪ 暂无歌词")
     }
 
+    /**
+     * 无歌词静默（v1.3.15）：宿主根本没有可播歌词时，歌名展示若干秒后调用本方法
+     * **清空状态栏**，并在本首剩余时间内不再推送任何内容（标题/歌词/占位）。
+     *
+     * 置 `noLyricHintShown = true` 是为了顺带堵掉「♪ 暂无歌词」占位——用户明确要求
+     * 这种歌曲清空后不要出现任何文案。切歌时 `onSongChanged` 会复位它。
+     */
+    @Synchronized
+    fun onSilence() {
+        noLyricHintShown = true
+        FlymeStatusBarLyric.clear()
+    }
+
     @Synchronized
     fun onPlaybackStateChanged(state: Int) {
         when (state) {
-            STATE_PLAYING -> {
-                playing = true
-                BackgroundLyrics.setPlaying(true)
-            }
-            STATE_PAUSED -> {
-                // 暂停：冻结当前行，不清除（状态栏保留最后一句，不闪烁）
-                playing = false
-                BackgroundLyrics.setPlaying(false)
-            }
+            STATE_PLAYING -> BackgroundLyrics.setPlaying(true)
+            // 暂停：冻结当前行，不清除（状态栏保留最后一句，不闪烁）
+            STATE_PAUSED -> BackgroundLyrics.setPlaying(false)
             STATE_STOPPED -> {
-                playing = false
                 FlymeStatusBarLyric.clear()
                 BackgroundLyrics.stop()
             }
             else -> Unit
         }
-        XLog.d("playback state: $state (playing=$playing)")
+        XLog.d("playback state: $state")
     }
 }
