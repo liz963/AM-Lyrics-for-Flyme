@@ -259,11 +259,16 @@ object TtmlBridge {
         XLog.i("TtmlBridge selfTest engine: $out")
     }
 
+    /** 模块自己产生的 TTML 都要能被认出来（见 [LyricsInjector.onNativeTtml]） */
+    const val SELF_TEST_MARK = "amlyric-selftest"
+
     private const val SAMPLE_ID = 3933000001L
 
     /** 最小可解析的 Word 逐字 TTML（结构照 AMLL TTML DB 的约定，见 [TtmlWriter]） */
     private fun sampleTtml(): String = buildString {
         append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+        // 自检样例也是走宿主解析器，会在解析 Hook 里露一次面 —— 带上标记让判据忽略它
+        append("<!--").append(SELF_TEST_MARK).append("-->\n")
         append("<tt xmlns=\"http://www.w3.org/ns/ttml\"")
         append(" xmlns:ttm=\"http://www.w3.org/ns/ttml#metadata\"")
         append(" xmlns:itunes=\"http://music.apple.com/lyric-ttml-internal\"")

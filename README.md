@@ -32,7 +32,7 @@ Hook Apple Music（`com.apple.android.music`），把当前播放歌曲的歌词
 |---|---|
 | `TTMLParser$TTMLParserNative.songInfoFromTTML(String) -> SongInfoPtr` | 把**外部** TTML 文本交给宿主自己的解析器变成 `SongInfoPtr`。这是"补一份歌词"的唯一入口 |
 | `SongInfo$SongInfoPtr.get()` / `setAdamId(long)` / `getSections()` | ptr → 原生对象；写歌曲标识；判断有没有内容 |
-| `SongInfo$SongInfoNative.getSongwriters(...) -> StringVectorNative` | **主判据**：原生歌词的创作者名单，非空即"宿主有可用歌词"（向量读 `size()` / `get(long)`） |
+| `SongInfo$SongInfoNative.getSongwriters(...) -> StringVectorNative` | **次判据**：原生歌词的创作者名单，非空即"宿主有可用歌词"（向量读 `size()` / `get(long)`） |
 | `SongInfo$SongInfoNative.getAvailableTiming()` | 时间轴类型枚举 `None` / `Line` / `Word`。作为第二判据；注入后也用它确认"真为逐字" |
 | `SongInfoTimeProcessor.processEvents(ptr, pos, 5×callback) -> long` | 驱动官方引擎求值（见 §3.2） |
 | `PlaybackItem.hasCustomLyrics()` | 用户自己配过歌词时为真，此时一律不动 |
@@ -165,7 +165,7 @@ BackgroundLyrics（每 tick）                       I2(null/SongInfoPtr) 被调
       ▼                                                    ▼
 LyricsInjector.eligible()                          LyricsInjector.decide()
       │  伴奏/纯音乐 → 跳过                                  │
-      │  有创作者名单/逐字 → 不补                            │
+      │  逐字 / 有创作者名单 → 不补                          │
       ▼                                                    │
 取词 worker（QQ / 网易云 → TimedLyrics → TTML）                │
       │                                                    │
@@ -181,32 +181,45 @@ TtmlBridge.parse(ttml) → SongInfoPtr               主线程重新进入 I2(pt
 | 宿主状态 | 处理 |
 |---|---|
 | `args[0] == null`（没交句柄） | **补** |
-| 句柄**带创作者名单**（`getSongwriters` 非空） | **不补**（主判据，见下） |
-| 无名单，但 `timing = Word`（逐字） | **不补**（第二道保险） |
-| 无名单，`timing = None / Line` | **补** |
+| `timing = Word`（逐字） | **不补**（主判据） |
+| `timing = None`（有歌词但**不滚动**） | **补** |
+| 句柄带创作者名单（`getSongwriters` 非空 / 原生 TTML 有 `<songwriters>`） | **不补**（第二道保险） |
+| 无名单、`timing = Line` | **补** |
 | 伴奏 / 纯音乐轨（标题关键词） | 跳过，不请求也不注入 |
 | `PlaybackItem.hasCustomLyrics()` 为真 | 不动 |
 
-**主判据为什么是 `songwriters` 而不是时间轴**：凡是播放页有滚动歌词的歌，歌词列表末尾几乎都会多出一行
-「创作者：xxx」—— 那行就是宿主从原生 TTML 的 `<iTunesMetadata><songwriters>` 渲染的，
-所以**有这份名单 ≈ 有可用原生歌词**（真机观察，用户口径）。而 `getAvailableTiming()` 会把
-**行级**歌词也报成 `Line`，行级在播放页上同样是逐行滚动的，按"非 Word 就替换"会成批误伤。
+顺序是刻意的：`Word` 意味着官方引擎给了**字级时间轴**，这份歌词一定可用；
+「创作者：xxx」只是"宿主有歌词"的旁证，所以是第二道保险。
 
-名单有**两条读取路径，任一命中即算"有原生歌词"**：
+**`None` 必须排在名单之前**：它表示"句柄交出来了，但里面没有可用时间轴"，
+真机表现就是**有歌词、但不滚动**。名单只能证明"宿主有歌词数据"，**证明不了"这份歌词能滚"**，
+让名单先说话就会把这些歌重新判成"不补"——用户明确要求这类也要补。
+
+**名单为什么重要**：`getAvailableTiming()` 会把**行级**歌词也报成 `Line`，而行级在播放页上同样会逐行滚动 ——
+按"非 Word 就替换"会成批误伤那些用户认为"有滚动歌词"的歌。名单正是用来把这类歌捞回来的。
+
+名单有**两条读取路径，任一命中即算"有"**：
 
 1. **文本侧（主）**：hook 宿主自己的解析入口 `TTMLParser$TTMLParserNative.songInfoFromTTML(String)`，
-   在文本被丢掉之前看一眼有没有 `<songwriter>`。那条「创作者：xxx」就是宿主从这段 XML 渲染的，
-   信息本来就在文本里，不必猜 JNI 参数。我们自己注入的那份靠来源标记（`TtmlWriter.SOURCE_LABEL`）排除，
-   避免拿自己的标注骗自己。
+   在文本被丢掉之前看一眼有没有 `<songwriter>`。那行「创作者：xxx」就是宿主从这段 XML 渲染的，
+   信息本来就在文本里，不必猜 JNI 参数。我们自己注入的那份靠来源标记（`TtmlWriter.SOURCE_LABEL`）排除。
 2. **句柄侧（补充）**：`SongInfo$SongInfoNative.getSongwriters(String) -> StringVectorNative`
    （JavaCPP native 绑定，名字不被 R8 改写；向量有 `size()` / `get(long)`）。
 
-两条都拿不到时退化为只看时间轴 —— 名单、时间轴是**或**关系，任一成立都不替换，
-保证"名单读取失效"不会把原生逐字歌词换成外部数据。
+**⚠️ 认歌只认"正数标识"**（v1.4.2 的 bug，v1.4.4 收敛）：宿主调 `songInfoFromTTML` 时，
+**返回的 ptr 上还没有歌曲标识** —— 实测 `getAdamId()` 拿到的是**未初始化的垃圾值**
+（形如 `-5476376653955703808`），不是 0。所以只取正数；认不出就落到**最近一份原生 TTML**（15s 窗口）。
 
-口径演进过三次，别改回去：最早还有"外语逐字缺翻译也补"（会把宿主带翻译的歌词换掉，翻译反而丢），
-后来一度改成"只要 Apple 有歌词就不替换"，再后来按 `timing` 判"能不能滚"又被真机反馈否掉
-（行级歌词同样会滚，却被当成"没有歌词"整首替换）。**现在以创作者名单为准。**
+**不要**在认不出时改用"当前正在播放的 adamId"记账 —— 它更新**滞后于解析**（实测落后一首），
+会把 B 歌的名单状态写到 A 头上：好一点是少补一首，坏一点是白白替换掉有歌词的歌。
+
+自检样例（`TtmlBridge.selfTest`）和我们的注入都会经过同一个解析入口，靠标记排除：
+前者带 `TtmlBridge.SELF_TEST_MARK`，后者带 `TtmlWriter.SOURCE_LABEL`。
+诊断看 `native ttml: native|own|selftest len=… songwriters=… ptrAdamId=… 采用=…` 这一行。
+
+口径演进过多次，别改回去：最早"外语逐字缺翻译也补"（把宿主带翻译的歌词换掉，翻译反而丢），
+后来"只要 Apple 有歌词就不替换"，再后来按 `timing` 判"能不能滚"（行级同样会滚，被误替换），
+然后是"有创作者名单就不替换"，最后收敛成 **`Word` 为主、名单兜行级**。
 
 **安装点的三个硬约束**
 

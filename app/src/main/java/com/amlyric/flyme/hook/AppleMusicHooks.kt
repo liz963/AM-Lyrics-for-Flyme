@@ -72,7 +72,7 @@ object AppleMusicHooks {
                 TtmlBridge.selfTest { ptr, pos -> BackgroundLyrics.probeLineAt(ptr, pos) }
                 // 开发期链路自检（网络 + 解析 + TTML 落地），发版前把 SELF_CHECK 关掉
                 LyricFetcher.selfCheck()
-                XLog.i("hooks installed (module 1.4.2)")
+                XLog.i("hooks installed (module 1.4.5)")
             }
         }
     }
