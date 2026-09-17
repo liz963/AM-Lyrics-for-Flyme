@@ -39,6 +39,18 @@ object TtmlWriter {
     /** 无翻译行的占位（保住条目顺序） */
     private const val ABSENT_TEXT = " "
 
+    /**
+     * 第三方来源标注的文案。
+     *
+     * 用户要求：**替换进来的歌词要在播放界面上标出来**（"这份不是 Apple 官方歌词"）。
+     * 落点见 [appendHead] —— 写进 `<songwriters>`，宿主渲染成歌词列表末尾的一行
+     * `创作者： 第三方歌词`（真机实测截图确认）。
+     *
+     * 【试过但没用的落点】往 `<body>` 末尾追加一个 `<p>第三方歌词</p>`：
+     * 宿主**完全不渲染**它（UI 树里查无此元素），所以不要走这条路。
+     */
+    internal const val SOURCE_LABEL = "第三方歌词"
+
     /** 行区间兜底时长：源没给 end 时用 begin + 这个值 */
     private const val FALLBACK_LINE_MS = 4000L
 
@@ -64,18 +76,42 @@ object TtmlWriter {
         }
     }
 
-    // ─────────────────────────── 头部：翻译轨 ───────────────────────────
+    // ─────────────────────────── 头部：来源标注 + 翻译轨 ───────────────────────────
 
+    /**
+     * 头部：**第三方来源标注** + 翻译轨。
+     *
+     * ══════════════ 为什么来源标注放在 `<songwriters>` ══════════════
+     *
+     * 宿主自己那份 TTML 的真机转储（6.5.2）长这样：
+     * ```xml
+     * <head><metadata><iTunesMetadata xmlns="...internal" leadingSilence="0.400">
+     *   <translations/><songwriters><songwriter>印子月</songwriter></songwriters>
+     * </iTunesMetadata></metadata></head>
+     * ```
+     * `songwriters` 就是整份 TTML 里**唯一承载非歌词文本**的元素 ——
+     * 歌词页的"歌曲制作信息"（宿主资源里的 `songcredits_lyrics_stroke` /
+     * `credits_lyrics_button`）读的就是它。把来源写进同一处，等于复用宿主自己的渲染，
+     * 不碰它的布局、也不进歌词滚动列表。
+     *
+     * 头部因此**无条件输出**（原先只在有翻译时才写），否则没翻译的歌就没有标注位置。
+     */
     private fun StringBuilder.appendHead(lines: List<TimedLine>) {
-        if (lines.none { !it.translation.isNullOrBlank() }) return
         append("<head><iTunesMetadata xmlns=\"$ITUNES_NS\">")
-        append("<translations><translation type=\"$TRANSLATION_TYPE\"")
-        append(" xml:lang=\"$TRANSLATION_LANGUAGE\">")
-        lines.forEachIndexed { index, line ->
-            val text = line.translation?.takeIf { it.isNotBlank() } ?: ABSENT_TEXT
-            append("<text for=\"${key(index)}\">").append(escape(text)).append("</text>")
+        // 来源标注（用户要求：替换进来的歌词要能看出来是第三方的）
+        append("<songwriters><songwriter>").append(escape(SOURCE_LABEL))
+            .append("</songwriter></songwriters>")
+
+        if (lines.any { !it.translation.isNullOrBlank() }) {
+            append("<translations><translation type=\"$TRANSLATION_TYPE\"")
+            append(" xml:lang=\"$TRANSLATION_LANGUAGE\">")
+            lines.forEachIndexed { index, line ->
+                val text = line.translation?.takeIf { it.isNotBlank() } ?: ABSENT_TEXT
+                append("<text for=\"${key(index)}\">").append(escape(text)).append("</text>")
+            }
+            append("</translation></translations>")
         }
-        append("</translation></translations></iTunesMetadata></head>")
+        append("</iTunesMetadata></head>")
     }
 
     // ─────────────────────────── 正文 ───────────────────────────

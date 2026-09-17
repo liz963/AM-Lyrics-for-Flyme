@@ -313,9 +313,9 @@ object BackgroundLyrics {
     /** 当前歌没有句柄：先查会话缓存，再主动取词 */
     private fun acquireLyricsHandle(item: Any, key: String, storeId: String?) {
         if (songPtr != null) {
-            // ★ 有句柄也可能"不合格"：非逐字时间轴、或外语逐字却没有翻译轨。
-            // 这两种正是用户要求补全的对象，且**不需要等待**——判据就在句柄里。
-            // 补全任务由 [LyricsInjector] 去重与执行，取好后经 onSongInfo 顶掉当前句柄。
+            // ★ 有句柄 = 宿主有原生歌词 = 一律不替换（用户口径 v1.4.1）。
+            // 判定本身在 [LyricsInjector.eligible] 里，这里只负责把句柄交过去
+            // （它同时也是"命中已补全结果就直接换"的入口）。
             requestOnlineCompletion(item, storeId, songPtr)
             return
         }

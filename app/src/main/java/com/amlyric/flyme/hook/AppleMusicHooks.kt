@@ -18,10 +18,11 @@ import java.lang.reflect.Executable
 /**
  * Apple Music Hook 层（libxposed API 102 拦截器链模型）。
  *
- * Hook 清单（v1.4.0）：
+ * Hook 清单（v1.4.2）：
  *  1. Application.attach                      初始化入口
  *  2. PlayerLyricsViewModel.loadLyrics        UI 路径歌词加载（歌曲同步）
  *  3. PlayerLyricsViewModel.buildTimeRangeToLyricsMap  歌词句柄捕获（缓存 + 后台驱动数据源）
+ *  3b. TTMLParser.songInfoFromTTML            ★ 原生 TTML 观察：有没有 <songwriters>（判据数据源）
  *  4. SongInfoTimeProcessor.processEvents     反射驱动官方歌词引擎（无 UI/后台均逐行推送）
  *  5. LocalMediaPlayerController.onPlaybackStateChanged 播放状态 + 控制器捕获
  *  6. NotificationManager.notify/cancel       ★ 载波模式：歌词 Ticker 注入宿主媒体通知
@@ -71,7 +72,7 @@ object AppleMusicHooks {
                 TtmlBridge.selfTest { ptr, pos -> BackgroundLyrics.probeLineAt(ptr, pos) }
                 // 开发期链路自检（网络 + 解析 + TTML 落地），发版前把 SELF_CHECK 关掉
                 LyricFetcher.selfCheck()
-                XLog.i("hooks installed (module 1.4.0)")
+                XLog.i("hooks installed (module 1.4.2)")
             }
         }
     }
@@ -79,9 +80,47 @@ object AppleMusicHooks {
     private fun installPlaybackHooks() {
         hookLyricsLoad()       // 歌词加载（UI 路径歌曲同步）
         hookLyricsBuild()      // 歌词句柄捕获 + 切歌 + 无歌词判定
+        hookNativeTtmlParse()  // ★ 原生 TTML 解析观察（判据：有没有 <songwriters>）
         hookLineCallback()     // 引擎推当前行（前台）
         hookPlaybackState()    // 播放状态 + 控制器捕获（位置/当前曲目来源）
         LyricsInjector.install(xposed, classLoader)  // 在线歌词注入（I2）
+    }
+
+    // ────────── 2c. 原生 TTML 解析观察（songwriters 判据的数据来源） ──────────
+
+    /**
+     * 拦宿主自己的 TTML 解析入口 `songInfoFromTTML(String) -> SongInfoPtr`，把
+     * "这份原生 TTML 里有没有 `<songwriters>`"告诉 [LyricsInjector]。
+     *
+     * 【为什么需要这一条】用户口径：**原生歌词有「创作者：xxx」就不替换**，而那行字
+     * 就是宿主从 `<iTunesMetadata><songwriters>` 渲染的。判断"有没有"最直接的办法
+     * 就是在文本还没被丢掉的时候看一眼。
+     *
+     * 这个入口我们自己也会走（[TtmlBridge.parse] 把补来的歌词交给宿主解析），
+     * 那部分靠来源标记排除，见 `LyricsInjector.onNativeTtml`。
+     */
+    private fun hookNativeTtmlParse() {
+        runHook("TTMLParser.songInfoFromTTML") {
+            val cls = classLoader.loadClass(
+                "com.apple.android.music.ttml.javanative.TTMLParser\$TTMLParserNative"
+            )
+            val method = cls.declaredMethods.firstOrNull { m ->
+                m.parameterCount == 1 &&
+                    m.parameterTypes[0] == String::class.java &&
+                    m.returnType.name.endsWith("SongInfo\$SongInfoPtr")
+            } ?: error("songInfoFromTTML(String) not found")
+            XLog.i("hook OK: songInfoFromTTML(String)")
+
+            xposed.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(XposedInterface.Hooker { chain ->
+                    val ttml = chain.getArg(0) as? String
+                    val result = chain.proceed()
+                    runCatching { LyricsInjector.onNativeTtml(ttml, result) }
+                        .onFailure { XLog.w("hook[songInfoFromTTML]: ${it.message}") }
+                    result
+                })
+        }
     }
 
     // ────────── 2a. UI 路径：歌词加载入口 ──────────

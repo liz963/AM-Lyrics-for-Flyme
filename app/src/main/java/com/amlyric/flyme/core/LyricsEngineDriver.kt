@@ -79,6 +79,34 @@ internal class LyricsEngineDriver(
     }
 
     private var processor: Any? = null
+
+    /**
+     * [peek] 专用的第二个处理器实例。
+     *
+     * ══════════════ 为什么必须与 [processor] 分开（v1.4.1 真机实测，改前必读）══════════════
+     *
+     * `SongInfoTimeProcessor.processEvents` **带内部游标**：它记住"上次报到哪个事件"，
+     * 只回报**游标之后**的新事件。而 [drive] 与 [peek] 的调用位置天然是一前一后
+     * （drive 在当前位置求值，peek 到"下一事件位置"取样），共用一个实例时：
+     *
+     * ```
+     * drive(q=115823)  ← 引擎认为该位置的行事件"已经报过了" → 回调 null
+     * peek (q=115723)  ← 上一次的这次调用把游标推到了这里（更早的位置却后调）…
+     * ```
+     * 真机症状（**转入后台后歌词延迟更新甚至不更新**，因为后台只有本类这一条驱动通路）：
+     * ```
+     * 后台 25 秒：ticker=0 条，cbInvoke 回调 7 条但**全部是 null**
+     * 同时：     engine nextPos=166858 ... nextText=[我猜着你的心 要再一次确定]  ← peek 取得到行
+     * ```
+     * 前台看不出问题，是因为前台的上屏主要由宿主 UI 自己的引擎（经 `lineEventCallback` Hook）
+     * 提供，本类驱动坏掉也无感。
+     *
+     * 两个实例各自单调前进、互不干扰，也就不存在"谁把谁的游标推走了"。
+     * ⚠️ 新增任何调用 `processEvents` 的地方，都必须**明确**挑一个实例，
+     * 绝不能让同一实例被两个不同节奏的位置交叉驱动。
+     */
+    private var peekProcessor: Any? = null
+
     private var processMethod: Method? = null
     private var displayCallbacks: Array<Any>? = null
     private var peekCallbacks: Array<Any>? = null
@@ -120,7 +148,8 @@ internal class LyricsEngineDriver(
      * 靠 [isInvoking] 把它挡掉（见该字段注释）。
      */
     fun peek(ptr: Any, atPos: Long): String? {
-        val tp = processor ?: return null
+        // ★ 必须用 peekProcessor：见该字段注释（共用实例会把 drive 的行事件"吃掉"）
+        val tp = peekProcessor ?: return null
         val m = processMethod ?: return null
         val cbs = peekCallbacks ?: return null
         peekedText = null
@@ -138,7 +167,12 @@ internal class LyricsEngineDriver(
     private fun build() {
         val tpClass = classLoader.loadClass(CLS_TIME_PROCESSOR)
         processor = tpClass.getDeclaredConstructor().newInstance()
-        XLog.i("SongInfoTimeProcessor created")
+        // 第二个实例专供 peek（见 peekProcessor 注释）。造不出来就只降级 peek，
+        // 绝不让它拖垮 drive —— 上屏比日志重要。
+        peekProcessor = runCatching { tpClass.getDeclaredConstructor().newInstance() }.getOrNull()
+        XLog.i(
+            "SongInfoTimeProcessor created (drive=1, peek=${if (peekProcessor != null) 1 else 0})"
+        )
 
         val m = tpClass.declaredMethods.firstOrNull { meth ->
             meth.name == "processEvents" &&

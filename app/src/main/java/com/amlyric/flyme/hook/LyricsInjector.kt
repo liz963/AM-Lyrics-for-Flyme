@@ -6,6 +6,7 @@ import com.amlyric.flyme.Settings
 import com.amlyric.flyme.XLog
 import com.amlyric.flyme.core.BackgroundLyrics
 import com.amlyric.flyme.lyric.LyricFetcher
+import com.amlyric.flyme.lyric.TtmlWriter
 import com.amlyric.flyme.util.Reflect
 import io.github.libxposed.api.XposedInterface
 import java.lang.ref.WeakReference
@@ -42,16 +43,28 @@ import java.util.concurrent.TimeUnit
  * ══════════════════════ 什么时候才允许联网（用户明确要求）══════════════════════
  *
  * **「自动实时补全」关掉时，播放过程中一个请求都不许发。**
- * 打开时也只有满足下面任一条才取词（[eligible]）：
- *  ① `args[0] == null`                      —— 原生歌词缺失；
- *  ② 时间轴不是逐字（timing 名不含 "word"） —— 不是逐字时间轴。
- * 并且：**已有原生逐字歌词一律不补（不管有没有翻译）**、**伴奏/纯音乐轨一律不补**、
- * `PlaybackItem.hasCustomLyrics()` 为真时一律不动（用户自己配的歌词优先）。
+ * 打开时只要**宿主拿不出能滚动的歌词**就取词（[eligible]）：
+ *  · `args[0] == null`   —— 根本没交句柄（宿主确实没有这首歌的歌词）；
+ *  · 句柄里**没有创作者名单**（songwriters）且时间轴不是逐字 —— 见下。
+ *
+ * **判据主信号 = 原生句柄里的 `songwriters`（创作者名单）**（v1.4.2 用户口径）：
+ * 真机观察，凡是在播放页有滚动歌词的歌，歌词页底部都会多一行「创作者：xxx」，
+ * 那一行就是宿主从 TTML 的 `<iTunesMetadata><songwriters>` 渲染出来的 ——
+ * 也就是说**有这份名单 ≈ 有可用原生歌词**。反过来没有名单的，多半就是没有。
+ * 名单从 `SongInfo$SongInfoNative.getSongwriters(...)` 读，见 [nativeSongwriters]。
+ *
+ * 第二信号是时间轴类型（[originalTiming]）：`Word`（逐字）本身也足以证明有原生歌词。
+ * 两者是**或**关系，任一成立就不替换 —— 这样即使某版宿主不再填名单，
+ * 也不会把原生逐字歌词误换成外部数据（那是比"少补一首"严重得多的回归）。
+ *
+ * 另外三条边界：
+ *  · **伴奏 / 纯音乐轨一律不补**（按标题关键词判定，这类轨本来就没有词可唱）；
+ *  · `PlaybackItem.hasCustomLyrics()` 为真时一律不动（用户自己配的歌词优先）；
+ *  · 结果落地前若宿主交出了原生歌词 → 整份丢弃（见 [hostHasLyrics]，反应用户口径的赛跑）。
  *
  * ⚠️ 判据全部来自 ptr 自身（`getAvailableTiming / getLanguage / getTranslation`），
  * **不需要**原始 TTML 文本 —— 宿主解析完就把文本丢了，我们拿不到。这也是为什么
  * 只有走到了 `I2`（拿到 ptr）才能做判定，比"提前猜"更可靠。
- * 读不出判据时按 AM++ 的语义**保守放行（不请求）**，宁可漏补也不乱补。
  *
  * ══════════════════════ 补出来的歌词怎么落地（两条通路）══════════════════════
  *
@@ -88,6 +101,9 @@ object LyricsInjector {
     /** 同时在跑的取词任务上限；队列满即丢（丢掉的下一帧 `I2` 会再触发一次） */
     private const val WORKER_QUEUE = 2
 
+    /** 创作者名单最多读几条（只用于判定"有没有"，不需要全文） */
+    private const val MAX_CREDITS = 16
+
     // ─────────────────────────── 解析出来的句柄 ───────────────────────────
 
     @Volatile private var installMethod: Method? = null
@@ -99,6 +115,10 @@ object LyricsInjector {
 
     /** 实测命中的那个字段（首次读到非 null 值时定下来，避免每次都遍历） */
     @Volatile private var liveItemField: Field? = null
+
+    /** 读创作者名单用的宿主 JNI 方法（`getSongwriters`），只解一次 */
+    @Volatile private var creditsMethod: Method? = null
+    @Volatile private var creditsMethodResolved = false
 
     @Volatile private var ready = false
     @Volatile private var unavailableReason: String? = null
@@ -131,6 +151,53 @@ object LyricsInjector {
      * 把真正有用的取词日志淹掉。
      */
     private val skipLogged = HashSet<Pair<Long, String>>()
+
+    /**
+     * 宿主**自己**交出过原生歌词的 adamId。
+     *
+     * 【为什么需要它】"这首歌到底有没有原生歌词"只能等宿主亲口说 —— 而宿主取词是异步的，
+     * 反应用户口径（**有原生歌词就不替换**）的时机因此变成一场赛跑：
+     * ```
+     * 切歌 → 宿主还没取到歌词（I2(null)）→ 宽限期到点 → 我们开始联网取词
+     *      → 几百毫秒后宿主把它自己那份原生歌词交出来了 ← 我们却已经把第三方的注入进去了
+     * ```
+     * 所以在"结果就要落地"的最后关口再复核一次：只要宿主期间给出过原生歌词，就整份丢弃。
+     *
+     * 只增不减，靠上限整体清空（真正的淘汰由"每首歌只判一次"的用法决定）。
+     */
+    private val hostHasLyrics = HashSet<Long>()
+
+    /**
+     * 已确认**带创作者名单**（songwriters）的歌曲 —— 判定为"宿主确有原生歌词"，永久不替换。
+     *
+     * 【为什么用名单而不是时间轴当主信号】用户真机口径（v1.4.2）：能滚动的原生歌词
+     * 几乎都带这份名单（播放页会多出一行「创作者：xxx」），而时间轴类型对**行级**歌词
+     * 也会给出 `Line`，被旧判据当成"没有歌词"而误替换。名单没有这个歧义。
+     */
+    private val nativeCredits = HashSet<Long>()
+
+    /**
+     * **宿主原生 TTML 里有没有 `<songwriters>`**（adamId → 有/无）。
+     *
+     * 由 [onNativeTtml] 在宿主解析原生歌词时观察得到 —— 这是本版判据的**主来源**，
+     * 比从句柄问 JNI 可靠（那条路要猜 `getSongwriters(String)` 的参数语义）。
+     */
+    private val nativeTtmlCredits = HashMap<Long, Boolean>()
+
+    /**
+     * 上次探测创作者名单的时刻（adamId → 毫秒）。
+     *
+     * 【为什么要节流】[eligible] 有两个高频入口（`I2` 每次装歌词 + 状态栏轮询每 tick），
+     * 而读名单要跨 JNI 拿一个新对象出来。没有名单的歌（正是要被替换的那些）
+     * 结果不会被缓存，不节流就是每秒两次 JNI 分配。
+     */
+    private val creditsProbedAt = HashMap<Long, Long>()
+
+    /** 名单命中时只打一次日志（否则每 3 秒一条） */
+    private val creditsLogged = HashSet<Long>()
+
+    /** 探测节流窗口 */
+    private const val CREDITS_PROBE_INTERVAL_MS = 3_000L
 
     /** 等结果回来要重入 `I2` 的 fragment（弱引用，fragment 销毁后自动清） */
     private val waiting = ArrayList<Waiting>()
@@ -289,6 +356,11 @@ object LyricsInjector {
         // 但那不代表这个页面以后不需要补 —— 早记下才稳。
         remember(fragment, adamId)
 
+        // 宿主这一帧交出的是**能用的原生歌词**（带创作者名单 / 逐字时间轴）→ 记账，
+        // 供结果落地前的最后关口复核（见 [hostHasLyrics]）。判据与 [eligible] 同一口径，
+        // 见 [hasNativeLyrics]。
+        if (hasNativeLyrics(original, adamId)) markHostLyrics(adamId)
+
         // ① 已经补好了（可能是上一次 I2 排的任务刚落地，或状态栏那条路先补上了）→ 直接换
         val cached = cachedPtr(adamId)
         XLog.d(
@@ -326,29 +398,243 @@ object LyricsInjector {
     /**
      * 条件判定。返回"补全理由"，不满足返回 null。
      *
-     * **只有两种情况才补（v1.4.0 用户口径，改前必读）：**
-     *  ① `original == null`   → 原生歌词缺失；
-     *  ② 时间轴不是逐字        → 宿主只给了行级歌词，没有逐字/滚动效果。
+     * **判定顺序（v1.4.2，改前必读）：**
+     *  ① 伴奏 / 纯音乐轨 → 不补（标题关键词，这类轨本来就没词可唱）；
+     *  ② `original == null` → **补**（宿主根本没交句柄）；
+     *  ③ 句柄**带创作者名单**（songwriters）→ 不补 ← **本版主判据**；
+     *  ④ 时间轴是逐字（`Word`）→ 不补；
+     *  ⑤ 其余（行级 / 读不到时间轴 / 名单为空）→ **补**。
      *
-     * ⚠️ **原生已经是逐字歌词时，一律不补 —— 不管它有没有翻译。**
-     * 早先还有第三条"外语逐字缺翻译也补"，已按用户要求删除：
-     * 那样会把宿主带翻译的歌词换成外部的，翻译反而可能丢。
+     * ⚠️ 口径演进（别再来回改）：
+     *  · 最早"外语逐字缺翻译也补" → 会把宿主带翻译的歌词换成外部的，翻译反而丢；
+     *  · 后来"只要 Apple 有歌词就一律不替换" → 真机发现**行级**原生歌词（`timing=Line`）
+     *    在播放页同样会逐行滚动，用户认为这就算"有滚动歌词"，却被旧判据整首替换掉了；
+     *  · 现在按用户指定改成「**有创作者名单就不替换**」，逐字时间轴作为第二道保险。
      *
-     * 另外**伴奏 / 纯音乐轨直接跳过**（用户明确要求）：这类轨本来就没有词可唱，
-     * 而歌词站上往往只有"人声版"的词，补进来会让纯音乐也滚出一串歌词 —— 明显是错的。
+     * ③④ 是**或**关系：任一成立都不替换。这是刻意的保守设计 —— 万一某版宿主不再填
+     * 名单（[nativeSongwriters] 读不到就返回空），至少不会把原生逐字歌词换成外部数据。
      *
-     * @param adamId 只用于 [skip] 的日志去重（这个入口会被高频调用）
+     * @param adamId 用于日志去重与名单结果缓存（这个入口会被高频调用）
      */
     private fun eligible(original: Any?, title: String, adamId: Long): String? {
         if (isInstrumental(title)) return skip(adamId, "伴奏/纯音乐轨('$title')")
         if (original == null) return "原生歌词缺失"
-
-        val native = Reflect.call(original, "get") ?: return skip(adamId, "从句柄读不出判据（保守不动）")
-        val timing = (Reflect.call(native, "getAvailableTiming") as? Enum<*>)?.name
-            ?: return skip(adamId, "读不到时间轴类型（保守不动）")
-        if (!timing.contains("word", ignoreCase = true)) return "非逐字时间轴(timing=$timing)"
-        return skip(adamId, "原生已经是逐字歌词(timing=$timing)")
+        val timing = originalTiming(original)
+        if (hasNativeCredits(original, adamId)) {
+            return skip(
+                adamId,
+                "原生歌词带创作者名单" + (if (timing != null) "(timing=$timing)" else "")
+            )
+        }
+        if (timing != null && isRollingTiming(timing)) {
+            return skip(adamId, "原生已经是逐字歌词(timing=$timing, 无创作者名单)")
+        }
+        return "无创作者名单" +
+            (if (timing != null) "且非逐字(timing=$timing)" else "(时间轴也读不到)")
     }
+
+    /**
+     * 宿主的原生歌词是不是**逐字 / 滚动**的（时间轴判据）。
+     *
+     * 只作为名单判据的**补充**：`Word` 意味着官方引擎有字级时间轴，很可靠；
+     * 但反过来不成立 —— `Line`（行级）在播放页上同样会逐行滚动，不能当"没歌词"。
+     */
+    private fun isRollingTiming(timing: String): Boolean =
+        timing.contains("word", ignoreCase = true)
+
+    /**
+     * 宿主交给我们的这份句柄，是不是**一份能用的原生歌词** —— 名单或逐字，任一成立即可。
+     *
+     * 供 [hostHasLyrics] 的记账使用：这是"结果落地前再复核一次"的判据，
+     * 必须和 [eligible] 的第三条保持同一个口径，否则会出现
+     * "判定时说不补、落地时又认为宿主没词"的自相矛盾。
+     */
+    private fun hasNativeLyrics(original: Any?, adamId: Long): Boolean {
+        if (original == null) return false
+        if (hasNativeCredits(original, adamId)) return true
+        val timing = originalTiming(original) ?: return false
+        return isRollingTiming(timing)
+    }
+
+    /**
+     * 原生句柄里有没有**创作者名单**（songwriters）。
+     *
+     * 名单来自宿主自己解析 TTML 的结果（`<iTunesMetadata><songwriters>`），
+     * 在播放页会渲染成一行「创作者：xxx」。有这行 ≈ 宿主有可用原生歌词。
+     * 读法见 [nativeSongwriters]，任何异常一律当作"没有"。
+     */
+    private fun hasNativeCredits(original: Any?, adamId: Long): Boolean {
+        if (original == null) return false
+        synchronized(nativeCredits) { if (adamId in nativeCredits) return true }
+
+        // ① 文本侧：宿主解析原生 TTML 时已经记下这首歌有没有 `<songwriters>`（见 [onNativeTtml]）
+        val fromTtml = synchronized(nativeTtmlCredits) { nativeTtmlCredits[adamId] }
+        if (fromTtml == true) {
+            markNativeCredits(adamId, "原生 TTML 的 <songwriters>")
+            return true
+        }
+
+        // ② 句柄侧：直接问 JNI（作为补充，参数语义不确定，见 [nativeSongwriters]）
+        val now = System.currentTimeMillis()
+        synchronized(creditsProbedAt) {
+            val last = creditsProbedAt[adamId]
+            if (last != null && now - last < CREDITS_PROBE_INTERVAL_MS) return false
+            if (creditsProbedAt.size > 64) creditsProbedAt.clear()
+            creditsProbedAt[adamId] = now
+        }
+
+        val list = nativeSongwriters(original)
+        if (list.isEmpty()) return false
+        markNativeCredits(adamId, "句柄 getSongwriters ${list.take(4)}")
+        return true
+    }
+
+    /** 记下"这首歌有创作者名单"，并打一次日志（[source] 说明是哪条路读到的） */
+    private fun markNativeCredits(adamId: Long, source: String) {
+        synchronized(nativeCredits) {
+            if (nativeCredits.size > 64) nativeCredits.clear()
+            nativeCredits.add(adamId)
+        }
+        synchronized(creditsLogged) {
+            if (creditsLogged.add(adamId)) {
+                XLog.i("native credits: 命中创作者名单 adamId=$adamId ← $source")
+            }
+        }
+    }
+
+    /**
+     * 调宿主 JNI 读创作者名单：`SongInfo$SongInfoNative.getSongwriters(...)` → `StringVectorNative`。
+     *
+     * 【为什么可以写死方法名】这一族是 JavaCPP 的 native 绑定（`com.apple.*.javanative.*`），
+     * 名字必须和 C++ 侧对上，R8 改不了 —— 与 `getAvailableTiming`/`getSections` 同理
+     * （真机 6.5.2 classes3.dex 核对：`getSongwriters(byte)`、`getSongwriter(byte, byte)`，
+     * 返回 `StringVector$StringVectorNative`，该向量有 `size()` 与 `get(long)`）。
+     *
+     * 【参数为什么按类型现填】native 方法的参数类型在 dex 里是 `byte` 这类窄类型，
+     * 直接传 Int 会 `IllegalArgumentException`。所以统一按 [defaultArg] 的类型适配填值，
+     * 不假定任何签名 —— 换成 0 参重载也能用。
+     *
+     * @return 名单（去空行、最多 [MAX_CREDITS] 条）；任何一步失败都返回空列表
+     */
+    private fun nativeSongwriters(original: Any?): List<String> {
+        val native = runCatching { Reflect.call(original, "get") }.getOrNull() ?: return emptyList()
+        val method = songwritersMethod(native.javaClass) ?: return emptyList()
+        val vector = runCatching { invokeDefaults(native, method) }.getOrNull() ?: return emptyList()
+        val size = (runCatching { Reflect.call(vector, "size") }.getOrNull() as? Number)?.toInt() ?: 0
+        if (size <= 0) return emptyList()
+        val getter = findMethod(vector.javaClass, "get", 1) ?: return emptyList()
+
+        val out = ArrayList<String>(minOf(size, MAX_CREDITS))
+        for (i in 0 until minOf(size, MAX_CREDITS)) {
+            val item = runCatching { invokeIndexed(vector, getter, i.toLong()) }.getOrNull()
+            val text = when (item) {
+                is String -> item
+                null -> null
+                else -> runCatching { item.toString() }.getOrNull()
+            }
+            // 我们自己写进去的来源标注不算"原生名单"（否则会拿自己的标注骗自己）
+            text?.trim()?.takeIf { it.isNotEmpty() && it != TtmlWriter.SOURCE_LABEL }?.let { out += it }
+        }
+        return out
+    }
+
+    /**
+     * 宿主自己解析了一份 TTML 之后的通报（由 [AppleMusicHooks] 的解析 Hook 调用）。
+     *
+     * 【为什么还要盯文本】播放页那行「创作者：xxx」就是宿主从原生 TTML 的
+     * `<iTunesMetadata><songwriters>` 渲染出来的，**信息本来就在文本里**；
+     * 而从句柄读要依赖 `getSongwriters(String)` 这个 JNI 接口的参数语义
+     * （真机日志只告诉我们参数是 String，传什么值才返回内容并不确定）。
+     * 所以文本侧是本版判据的主来源，句柄侧只作补充。
+     *
+     * @param ttml 宿主解析的原始文本；**我们自己的注入会被排除**（见 [TtmlWriter.SOURCE_LABEL]，
+     *   我们写标注时用的是一个固定串，靠它区分来源，否则会拿自己的标注骗自己）
+     * @param ptr  解析产物，用它的 adamId 认歌
+     */
+    fun onNativeTtml(ttml: String?, ptr: Any?) {
+        if (ttml.isNullOrBlank() || ptr == null) return
+        if (ttml.contains(TtmlWriter.SOURCE_LABEL)) return
+        val adamId = TtmlBridge.adamIdOf(ptr) ?: return
+        if (adamId <= 0L) return
+
+        val has = ttml.contains("<songwriter", ignoreCase = true)
+        synchronized(nativeTtmlCredits) {
+            if (nativeTtmlCredits.size > 128) nativeTtmlCredits.clear()
+            nativeTtmlCredits[adamId] = has
+        }
+        XLog.d("native ttml: adamId=$adamId songwriters=$has (${ttml.length} chars)")
+        if (has) markNativeCredits(adamId, "原生 TTML 的 <songwriters>")
+    }
+
+    /** 定位 `getSongwriters`（0/1 参）或 `getSongwriter`（2 参），只解一次 */
+    private fun songwritersMethod(nativeClass: Class<*>): Method? {
+        if (creditsMethodResolved) return creditsMethod
+        synchronized(this) {
+            if (creditsMethodResolved) return creditsMethod
+            creditsMethodResolved = true
+            creditsMethod = findMethod(nativeClass, "getSongwriters", 1)
+                ?: findMethod(nativeClass, "getSongwriters", 0)
+                ?: findMethod(nativeClass, "getSongwriter", 2)
+            XLog.i(
+                "native credits probe: " + (
+                    creditsMethod?.let {
+                        "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})"
+                    } ?: "getSongwriters 不存在（本版只能按时间轴判定）"
+                    )
+            )
+        }
+        return creditsMethod
+    }
+
+    /** 沿继承链找方法（native 方法声明在 JavaCPP 子类上，父类可能也有同名重载） */
+    private fun findMethod(cls: Class<*>, name: String, argc: Int): Method? {
+        var c: Class<*>? = cls
+        while (c != null && c != Any::class.java) {
+            c.declaredMethods.firstOrNull { it.name == name && it.parameterCount == argc }?.let {
+                it.isAccessible = true
+                return it
+            }
+            c = c.superclass
+        }
+        return cls.methods.firstOrNull { it.name == name && it.parameterCount == argc }
+            ?.also { it.isAccessible = true }
+    }
+
+    private fun invokeDefaults(target: Any, m: Method): Any? {
+        val args = Array<Any?>(m.parameterCount) { defaultArg(m.parameterTypes[it], null) }
+        m.isAccessible = true
+        return m.invoke(target, *args)
+    }
+
+    private fun invokeIndexed(target: Any, m: Method, index: Long): Any? {
+        val args = Array<Any?>(m.parameterCount) { i ->
+            defaultArg(m.parameterTypes[i], if (i == 0) index else null)
+        }
+        m.isAccessible = true
+        return m.invoke(target, *args)
+    }
+
+    /** 按参数类型造默认实参；`index != null` 时用作第 0 个参数（见 [nativeSongwriters]） */
+    private fun defaultArg(type: Class<*>, index: Long?): Any? = when (type) {
+        Boolean::class.javaPrimitiveType -> index != null && index != 0L
+        Byte::class.javaPrimitiveType -> (index ?: 0L).toByte()
+        Short::class.javaPrimitiveType -> (index ?: 0L).toShort()
+        Int::class.javaPrimitiveType -> (index ?: 0L).toInt()
+        Long::class.javaPrimitiveType -> index ?: 0L
+        Char::class.javaPrimitiveType -> 0.toChar()
+        Float::class.javaPrimitiveType -> 0f
+        Double::class.javaPrimitiveType -> 0.0
+        // `getSongwriters` 实测是 `(String)`（真机 6.5.2 日志：`native credits probe: getSongwriters(String)`）。
+        // 传 null 会被 JNI 侧当"没有语言"处理，传空串才是"不限定"。
+        String::class.java, CharSequence::class.java -> ""
+        else -> null
+    }
+
+    /** 读原生句柄的时间轴类型（枚举常量名，如 Word / Line）；读不到返回 null（仅为日志服务） */
+    private fun originalTiming(original: Any?): String? = runCatching {
+        val native = Reflect.call(original, "get") ?: return null
+        (Reflect.call(native, "getAvailableTiming") as? Enum<*>)?.name
+    }.getOrNull()
 
     /**
      * 记一条"不补"日志并返回 `null`（让调用点写成 `return skip(...)`，读起来是一条直线）。
@@ -437,6 +723,13 @@ object LyricsInjector {
                 forget(adamId)
                 return
             }
+            // 排队这段时间里宿主可能已经把原生歌词取回来了：那就根本不该再取（用户口径：
+            // 有原生歌词就不替换）。放在联网之前，能省掉一次白跑的网络请求。
+            if (hostHadLyrics(adamId)) {
+                XLog.i("lyrics inject: 放弃取词 —— 期间宿主已给出原生歌词 | '$title'")
+                forget(adamId)
+                return
+            }
             val prepared = LyricFetcher.prepare(title, artist, album, durationMs)
             if (prepared == null) {
                 XLog.w("lyrics inject: no lyrics for '$title - $artist'")
@@ -450,6 +743,13 @@ object LyricsInjector {
                         "($title, ${prepared.ttml.length} chars)"
                 )
                 giveUp(adamId)
+                return
+            }
+            // ★ 最后一道关口：取词这几百毫秒里，宿主很可能已经把它自己那份原生歌词取回来了。
+            // 一旦如此就整份丢弃 —— 用户口径是"有原生歌词就不替换"，哪怕我们这份是逐字的。
+            if (hostHadLyrics(adamId)) {
+                XLog.i("lyrics inject: 放弃注入 —— 期间宿主已给出原生歌词 | '$title'")
+                forget(adamId)
                 return
             }
             // 写歌曲标识：宿主多处会拿它跟当前播放项比对，不写会被当"身份不符"忽略
@@ -492,6 +792,19 @@ object LyricsInjector {
     private fun forget(adamId: Long) {
         synchronized(readyPtrs) { inFlight.remove(adamId) }
     }
+
+    /** 记下"宿主确实有这首歌的原生歌词"（见 [hostHasLyrics]） */
+    private fun markHostLyrics(adamId: Long) {
+        if (adamId <= 0L) return
+        synchronized(hostHasLyrics) {
+            if (hostHasLyrics.size > 128) hostHasLyrics.clear()
+            hostHasLyrics.add(adamId)
+        }
+    }
+
+    /** 宿主在本次补全期间是否已经交出原生歌词 */
+    private fun hostHadLyrics(adamId: Long): Boolean =
+        synchronized(hostHasLyrics) { adamId in hostHasLyrics }
 
     // ═══════════════════════════ 落地（主线程） ═══════════════════════════
 
@@ -616,6 +929,10 @@ object LyricsInjector {
         val adamId = storeId?.toLongOrNull() ?: return native
         currentAdamId = adamId
         val cached = cachedPtr(adamId)
+        // 宿主自己送来一份（不是我们回灌给它的那份）→ 它确实有原生歌词，记账。
+        // 这是"宽限期误判之后才发现宿主其实有词"的主要发现途径：宿主常常不重调 I2，
+        // 只走 LyricsLoader.onPtrCaptured 这条路把句柄交过来。
+        if (native !== cached && hasNativeLyrics(native, adamId)) markHostLyrics(adamId)
         XLog.d(
             "preferredPtr: adamId=$adamId 采用=${if (cached != null) "补全结果" else "宿主原生"} " +
                 "(raw=${readyPtrs[adamId] != null} alive=${readyPtrs[adamId]?.let { TtmlBridge.isAlive(it) }})"
