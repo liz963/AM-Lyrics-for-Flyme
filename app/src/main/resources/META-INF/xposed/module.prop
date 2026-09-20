@@ -1,6 +1,6 @@
 minApiVersion=100
 targetApiVersion=102
-version=1.4.0
-versionCode=23
+version=1.4.6
+versionCode=31
 # 作用域固定为 Apple Music，禁止用户把模块勾到其它应用
 staticScope=true
