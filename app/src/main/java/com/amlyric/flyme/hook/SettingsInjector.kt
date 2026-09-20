@@ -230,9 +230,9 @@ internal object SettingsInjector {
                 Spec(
                     "auto_complete", "自动实时补全",
                     // 措辞与 LyricsInjector.eligible() 的判定必须一致，改一处要改两处
-                    "Apple Music 没有歌词、或只有不会滚动的静态歌词时，" +
+                    "Apple Music 没有歌词、或原生歌词不会滚动（静态）时，" +
                         "从在线源补一份逐字歌词并注入播放页；" +
-                        "带创作者名单的原生歌词与伴奏轨都不替换",
+                        "能滚动（逐字 / 逐行）的原生歌词与伴奏轨都不替换",
                     { Settings.autoComplete }, Settings::setAutoComplete,
                 ),
                 Spec(

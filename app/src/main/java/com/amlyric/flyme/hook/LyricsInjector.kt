@@ -45,19 +45,17 @@ import java.util.concurrent.TimeUnit
  * **「自动实时补全」关掉时，播放过程中一个请求都不许发。**
  * 打开时只要**宿主拿不出能滚动的歌词**就取词（[eligible]）：
  *  · `args[0] == null`   —— 根本没交句柄（宿主确实没有这首歌的歌词）；
- *  · 句柄里**没有创作者名单**（songwriters）且时间轴不是逐字 —— 见下。
+ *  · 句柄的 `getAvailableTiming()` 既不是 `Word` 也不是 `Line` —— 见下。
  *
- * **判定信号（v1.4.3 用户口径，顺序固定，见 [eligible]）**：
- *  ① `timing = Word`（逐字）→ **不替换** —— 主判据，官方引擎给了字级时间轴，这份歌词一定可用；
- *  ② `timing = None`（有歌词但**不滚动**）→ **替换**（排在名单之前：名单证明不了"能滚"）；
- *  ③ 原生 TTML 带 `<songwriters>`（歌词页会多一行「创作者：xxx」）→ **不替换**；
- *  ④ 以上都不成立 → 替换。
+ * **判定信号（v1.4.6 用户口径，唯一判据，见 [eligible]）**：
+ *  ① `timing = Word`（逐字）/ `Line`（逐行）→ **不替换**（播放页与状态栏都会滚动）；
+ *  ② `timing = None`（有歌词数据但静态不滚）→ **替换**；
+ *  ③ `timing` 读不到 → **替换**（保守取向：证明不了"能滚"就当不能滚）。
  *
- * 名单的读法见 [nativeSongwriters]：**hook 宿主解析入口 `songInfoFromTTML` 读原文为主**
- * （信息本来就在 XML 里，不用猜 JNI 参数），反射 `getSongwriters` 为补充。
- * ⚠️ 宿主调解析时**返回的 ptr 上还没有歌曲标识**（实测是未初始化的垃圾值，不是 0），
- * 所以认歌只认"正数标识"，认不出就落到"最近一份原生 TTML"（15s 窗口，见 [onNativeTtml]）。
- * 少了这一步，每首歌的观察结果都会被静默丢掉 —— 这正是 v1.4.2 "有创作者却被替换"的原因。
+ * ⚠️ **创作者名单（songwriters）自 v1.4.6 起不参与决策**。v1.4.2~v1.4.5 曾用它当判据，
+ * 2026-09-20 真机 16 首实测把它证伪：逐行的 `Line` 原生歌词**全都带名单**，
+ * 而名单只证明"宿主有歌词数据"，证明不了"这份歌词能滚"。读取代码保留，仅供日志排查
+ * （见 [hasNativeCredits]）。
  *
  * 另外三条边界：
  *  · **伴奏 / 纯音乐轨一律不补**（按标题关键词判定，这类轨本来就没有词可唱）；
@@ -172,17 +170,16 @@ object LyricsInjector {
     /**
      * 已确认**带创作者名单**（songwriters）的歌曲 —— 判定为"宿主确有原生歌词"，永久不替换。
      *
-     * 【为什么用名单而不是时间轴当主信号】用户真机口径（v1.4.2）：能滚动的原生歌词
-     * 几乎都带这份名单（播放页会多出一行「创作者：xxx」），而时间轴类型对**行级**歌词
-     * 也会给出 `Line`，被旧判据当成"没有歌词"而误替换。名单没有这个歧义。
+     * ⚠️ 自 v1.4.6 起**不参与决策**，仅作日志排查（名单判据已被真机数据证伪，
+     * 见 [eligible] 的口径演进）。
      */
     private val nativeCredits = HashSet<Long>()
 
     /**
      * **宿主原生 TTML 里有没有 `<songwriters>`**（adamId → 有/无）。
      *
-     * 由 [onNativeTtml] 在宿主解析原生歌词时观察得到 —— 这是本版判据的**主来源**，
-     * 比从句柄问 JNI 可靠（那条路要猜 `getSongwriters(String)` 的参数语义）。
+     * 由 [onNativeTtml] 在宿主解析原生歌词时观察得到。
+     * ⚠️ 自 v1.4.6 起**不参与决策**（见 [hasNativeCredits]）。
      */
     private val nativeTtmlCredits = HashMap<Long, Boolean>()
 
@@ -201,10 +198,12 @@ object LyricsInjector {
     /**
      * 最近一份**原生** TTML 有没有创作者名单（认不出它是哪首歌时的兜底，见 [onNativeTtml]）。
      *
-     * 【为什么需要】真机实测（v1.4.2）：宿主调 `songInfoFromTTML` 时，**返回的 ptr 上还没有歌曲标识**
-     * （adamId=0 —— 标识是调用方随后写进去的，我们自己注入时也是自己 `bindAdamId`），
-     * 于是那份 TTML 的观察结果没法记账，歌词页明明有「创作者：xxx」的歌照样被判"无名单"给换掉。
-     * 解析紧跟着这首歌的加载流程，所以在窗口期内把"最近一份"当作当前这首歌的兜底。
+     * ⚠️ 自 v1.4.6 起**不参与决策**（这条兜底会跨歌误报：A 歌的名单可能记到 B 歌头上，
+     * 见 [eligible] 的口径演进）。
+     *
+     * 【为什么当初需要它】真机实测（v1.4.2）：宿主调 `songInfoFromTTML` 时，**返回的 ptr 上还没有歌曲标识**
+     * （实测是未初始化的垃圾负值 —— 标识是调用方随后写进去的，我们自己注入时也是自己 `bindAdamId`），
+     * 于是那份 TTML 的观察结果没法记账。
      */
     @Volatile private var recentTtmlHasWriters = false
     @Volatile private var recentTtmlAt = 0L
@@ -414,91 +413,71 @@ object LyricsInjector {
     /**
      * 条件判定。返回"补全理由"，不满足返回 null。
      *
-     * **判定顺序（v1.4.3，改前必读）：**
+     * **判定顺序（v1.4.6，改前必读）—— 唯一判据是时间轴类型：**
      *  ① 伴奏 / 纯音乐轨 → 不补（标题关键词，这类轨本来就没词可唱）；
      *  ② `original == null` → **补**（宿主根本没交句柄）；
-     *  ③ 时间轴是逐字（`Word`）→ 不补 ← **主判据**；
-     *  ④ 时间轴是 `None`（有歌词但不滚动）→ **补**（用户明确要求，排在名单之前）；
-     *  ⑤ 带创作者名单（songwriters）→ 不补；
-     *  ⑥ 其余（行级 / 读不到时间轴 / 名单为空）→ **补**。
+     *  ③ `timing = Word / Line` → **不补**（逐字与逐行，在播放页/状态栏都会滚动）；
+     *  ④ `timing = None` → **补**（有歌词数据但静态不滚）；
+     *  ⑤ `timing` 读不到 → **补**（保守取向：证明不了"能滚"就当不能滚）。
      *
      * ⚠️ 口径演进（别再来回改）：
      *  · 最早"外语逐字缺翻译也补" → 会把宿主带翻译的歌词换成外部的，翻译反而丢；
-     *  · 后来"只要 Apple 有歌词就一律不替换" → 真机发现**行级**原生歌词（`timing=Line`）
-     *    在播放页同样会逐行滚动，用户认为这就算"有滚动歌词"，却被旧判据整首替换掉了；
-     *  · 于是加"有创作者名单也不替换"（用户指定的信号：歌词页那行「创作者：xxx」）；
-     *  · v1.4.2 的名单判据**实际没生效** —— 宿主解析 TTML 时 ptr 上还没有歌曲标识，
-     *    观察结果被静默丢弃。v1.4.3/1.4.4 修的就是这个（见 [onNativeTtml] 的认歌规则）。
+     *  · 中间试过"原生歌词带创作者名单就不补"（当时指定的信号：歌词页那行「创作者：xxx」）。
+     *    **真机数据（2026-09-20，16 首实测）推翻了它**：逐行的 `Line` 原生歌词**全都带名单**，
+     *    而名单只能证明"宿主有歌词数据"，证明不了"这份歌词能滚"。用户最终口径是
+     *    「能滚就别动，不能滚才补」—— 于是名单判据**整体退出决策**（读取代码保留，仅作诊断）。
      *
-     * @param adamId 用于日志去重与名单结果缓存（这个入口会被高频调用）
+     * @param adamId 用于日志去重（这个入口会被高频调用）
      */
     private fun eligible(original: Any?, title: String, adamId: Long): String? {
         if (isInstrumental(title)) return skip(adamId, "伴奏/纯音乐轨('$title')")
-        if (original == null) return "原生歌词缺失"
-        val timing = originalTiming(original)
-
-        // ① 主判据：逐字时间轴 —— 官方引擎给出了字级时间轴，这份歌词一定可用
-        if (timing != null && isRollingTiming(timing)) {
-            return skip(adamId, "原生已经是逐字歌词(timing=$timing)")
-        }
-        // ② `None`：句柄交出来了，但里面**没有可用时间轴** —— 真机表现是"有歌词但不滚动"。
-        //    用户口径（2026-09-18）：这种也要补。必须排在名单判据**之前**，否则会被名单救下来：
-        //    名单只能证明"宿主有歌词数据"，证明不了"这份歌词能滚"。
-        if (timing != null && isStaticTiming(timing)) {
-            return "原生歌词不滚动(timing=$timing)"
-        }
-        // ③ 次判据：歌词页会多一行「创作者：xxx」的那种（原生 TTML 带 <songwriters>）
-        if (hasNativeCredits(original, adamId)) {
-            return skip(
-                adamId,
-                "原生歌词带创作者名单" + (if (timing != null) "(timing=$timing)" else "")
-            )
-        }
-        return "无创作者名单" +
-            (if (timing != null) "且非逐字(timing=$timing)" else "(时间轴也读不到)")
+        if (original == null) return "原生歌词缺失(宿主没交句柄)"
+        val timing = originalTiming(original) ?: return "时间轴读不到"
+        if (isRollingTiming(timing)) return skip(adamId, "原生歌词能滚动(timing=$timing)")
+        return "原生歌词不滚动(timing=$timing)"
     }
 
     /**
-     * 宿主的原生歌词是不是**逐字 / 滚动**的（时间轴判据）。
+     * 宿主的原生歌词是不是**能滚**的 —— v1.4.6 起唯一的决策判据。
      *
-     * 只作为名单判据的**补充**：`Word` 意味着官方引擎有字级时间轴，很可靠；
-     * 但反过来不成立 —— `Line`（行级）在播放页上同样会逐行滚动，不能当"没歌词"。
+     * · `Word`（字级时间轴）：官方引擎逐字高亮，最完整的一档；
+     * · `Line`（行级时间轴）：播放页与状态栏同样**逐行滚动**，算"能滚"
+     *   （真机实测 2026-09-20：一批 Line 原生歌词滚动正常，用户确认不替换）。
+     *
+     * 剩下的 `None`（静态）与"读不到"一律走"补"（见 [eligible]）。
      */
     private fun isRollingTiming(timing: String): Boolean =
-        timing.contains("word", ignoreCase = true)
+        timing.contains("word", ignoreCase = true) || timing.contains("line", ignoreCase = true)
 
     /**
-     * 时间轴是不是"交了句柄但用不了"（`None`）。
+     * 宿主交给我们的这份句柄，是不是**一份能滚的原生歌词**（口径同 [eligible]）。
      *
-     * 真机表现是**有歌词但不滚动**（静态一段/歌词页一片空白）。用户口径（2026-09-18）：
-     * 这种也要补 —— 所以它必须排在创作者名单判据**之前**（见 [eligible]）。
-     */
-    private fun isStaticTiming(timing: String): Boolean =
-        timing.contains("none", ignoreCase = true)
-
-    /**
-     * 宿主交给我们的这份句柄，是不是**一份能用的原生歌词** —— 名单或逐字，任一成立即可。
+     * 供 `hostHasLyrics` 的记账使用：这是"结果落地前再复核一次"的判据，
+     * **必须和 [eligible] 保持同一口径** —— 否则要么把刚补好的歌词在落地前丢掉
+     * （复核比判定更宽松），要么判定说不补、复核又说宿主没词（更严格）。
      *
-     * 供 [hostHasLyrics] 的记账使用：这是"结果落地前再复核一次"的判据，
-     * 必须和 [eligible] 的第三条保持同一个口径，否则会出现
-     * "判定时说不补、落地时又认为宿主没词"的自相矛盾。
+     * `None` / 读不到 → false：这类歌词正是我们要替换掉的，不能算"能用的原生歌词"。
+     *
+     * @param adamId 目前不参与判定，仅为调用点签名统一保留
      */
     private fun hasNativeLyrics(original: Any?, adamId: Long): Boolean {
         if (original == null) return false
-        val timing = originalTiming(original)
-        if (timing != null && isRollingTiming(timing)) return true
-        // `None` 不滚动 → 不算"能用的原生歌词"，否则刚补好的歌词会在落地前被这道复核丢掉
-        if (timing != null && isStaticTiming(timing)) return false
-        return hasNativeCredits(original, adamId)
+        val timing = originalTiming(original) ?: return false
+        return isRollingTiming(timing)
     }
 
     /**
      * 原生句柄里有没有**创作者名单**（songwriters）。
      *
      * 名单来自宿主自己解析 TTML 的结果（`<iTunesMetadata><songwriters>`），
-     * 在播放页会渲染成一行「创作者：xxx」。有这行 ≈ 宿主有可用原生歌词。
+     * 在播放页会渲染成一行「创作者：xxx」。
+     *
+     * ⚠️ **自 v1.4.6 起不参与任何决策**（[eligible] 只看时间轴类型）。
+     * 保留整条读取链只为排查用：真机日志里那句
+     * `native credits: 命中创作者名单 …` 是判断"宿主这份歌词到底带不带名单"的唯一手段。
      * 读法见 [nativeSongwriters]，任何异常一律当作"没有"。
      */
+    @Suppress("unused")
     private fun hasNativeCredits(original: Any?, adamId: Long): Boolean {
         if (original == null) return false
         synchronized(nativeCredits) { if (adamId in nativeCredits) return true }

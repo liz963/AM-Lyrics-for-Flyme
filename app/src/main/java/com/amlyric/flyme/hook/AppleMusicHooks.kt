@@ -72,7 +72,7 @@ object AppleMusicHooks {
                 TtmlBridge.selfTest { ptr, pos -> BackgroundLyrics.probeLineAt(ptr, pos) }
                 // 开发期链路自检（网络 + 解析 + TTML 落地），发版前把 SELF_CHECK 关掉
                 LyricFetcher.selfCheck()
-                XLog.i("hooks installed (module 1.4.5)")
+                XLog.i("hooks installed (module 1.4.6)")
             }
         }
     }
@@ -80,7 +80,7 @@ object AppleMusicHooks {
     private fun installPlaybackHooks() {
         hookLyricsLoad()       // 歌词加载（UI 路径歌曲同步）
         hookLyricsBuild()      // 歌词句柄捕获 + 切歌 + 无歌词判定
-        hookNativeTtmlParse()  // ★ 原生 TTML 解析观察（判据：有没有 <songwriters>）
+        hookNativeTtmlParse()  // 原生 TTML 解析观察（诊断用：宿主这份歌词带不带创作者名单）
         hookLineCallback()     // 引擎推当前行（前台）
         hookPlaybackState()    // 播放状态 + 控制器捕获（位置/当前曲目来源）
         LyricsInjector.install(xposed, classLoader)  // 在线歌词注入（I2）
